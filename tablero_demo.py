@@ -1,4 +1,5 @@
 """Prototipo visual del tablero. Datos simulados, sin conexion a DynamoDB."""
+"""Prototipo visual del tablero. Datos simulados, sin conexion a DynamoDB."""
 import flet as ft
 
 TAREAS = [
@@ -43,7 +44,7 @@ def columna(estado, tareas):
                         content=ft.Text(str(len(de_este_estado)), size=11),
                         bgcolor=ft.Colors.WHITE,
                         border_radius=10,
-                        padding=ft.padding.symmetric(horizontal=8, vertical=2),
+                        padding=ft.Padding(8, 2, 8, 2),
                     ),
                 ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                 bgcolor=COLORES[estado],
@@ -73,7 +74,7 @@ def main(page: ft.Page):
         ),
         ft.Container(
             content=ft.Text("Proyecto: Entrega 1 - Idea de proyecto", size=13, color=ft.Colors.GREY_700),
-            padding=ft.padding.symmetric(horizontal=16, vertical=10),
+            padding=ft.Padding(16, 10, 16, 10),
         ),
         ft.Row(
             [columna(e, TAREAS) for e in ("Pendiente", "En progreso", "Terminado")],
@@ -88,4 +89,4 @@ def main(page: ft.Page):
     page.update()
 
 
-ft.run(main, view=ft.AppView.WEB_BROWSER, port=8551, host="0.0.0.0")
+ft.run(main, view=ft.AppView.WEB_BROWSER, port=8550, host="0.0.0.0")
