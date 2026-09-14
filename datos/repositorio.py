@@ -103,3 +103,60 @@ def unirse_a_proyecto(codigo, id_usuario, nombre_usuario):
         "fecha_vinculacion": _ahora(),
     })
     return proyecto
+
+
+
+
+
+ESTADOS = ("Pendiente", "En progreso", "Terminado")
+
+
+def crear_tarea(id_proyecto, titulo, descripcion, responsable, fecha_limite):
+    """Crea una tarea en estado Pendiente (REQ-03)."""
+    tabla = obtener_tabla()
+    id_tarea = str(uuid.uuid4())
+    momento = _ahora()
+
+    elemento = {
+        "PK": f"PROYECTO#{id_proyecto}",
+        "SK": f"TAREA#{id_tarea}",
+        "titulo": titulo,
+        "descripcion": descripcion,
+        "estado": "Pendiente",
+        "responsable": responsable,
+        "fecha_limite": fecha_limite,
+        "fecha_creacion": momento,
+        "fecha_actualizacion": momento,
+    }
+    tabla.put_item(Item=elemento)
+    return elemento
+
+
+def cambiar_estado(id_proyecto, id_tarea, nuevo_estado):
+    """Cambia el estado de una tarea y registra la fecha del cambio (REQ-04).
+
+    Lanza ValueError si el estado no es uno de los tres admitidos.
+    """
+    if nuevo_estado not in ESTADOS:
+        raise ValueError(f"Estado invalido: {nuevo_estado}. Admitidos: {ESTADOS}")
+
+    tabla = obtener_tabla()
+    respuesta = tabla.update_item(
+        Key={"PK": f"PROYECTO#{id_proyecto}", "SK": f"TAREA#{id_tarea}"},
+        UpdateExpression="SET estado = :e, fecha_actualizacion = :f",
+        ExpressionAttributeValues={":e": nuevo_estado, ":f": _ahora()},
+        ConditionExpression="attribute_exists(PK)",
+        ReturnValues="ALL_NEW",
+    )
+    return respuesta["Attributes"]
+
+
+def listar_tareas(id_proyecto):
+    """Devuelve todas las tareas de un proyecto en una sola consulta."""
+    from boto3.dynamodb.conditions import Key
+    tabla = obtener_tabla()
+    respuesta = tabla.query(
+        KeyConditionExpression=Key("PK").eq(f"PROYECTO#{id_proyecto}")
+        & Key("SK").begins_with("TAREA#")
+    )
+    return respuesta["Items"]
