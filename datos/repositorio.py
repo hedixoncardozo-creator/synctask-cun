@@ -64,3 +64,42 @@ def crear_proyecto(nombre, descripcion, id_administrador):
         ]
     )
     return metadatos
+
+
+def buscar_proyecto_por_codigo(codigo):
+    """Resuelve un codigo de acceso a los metadatos del proyecto (REQ-02).
+
+    Usa el elemento espejo CODIGO#{codigo} para obtener el id del proyecto
+    con una lectura directa, y luego recupera sus metadatos. Dos get_item
+    en lugar de recorrer la tabla.
+    """
+    tabla = obtener_tabla()
+
+    espejo = tabla.get_item(Key={"PK": f"CODIGO#{codigo.upper()}", "SK": "PROYECTO"})
+    if "Item" not in espejo:
+        return None
+
+    id_proyecto = espejo["Item"]["id_proyecto"]
+    proyecto = tabla.get_item(Key={"PK": f"PROYECTO#{id_proyecto}", "SK": "METADATOS"})
+    return proyecto.get("Item")
+
+
+def unirse_a_proyecto(codigo, id_usuario, nombre_usuario):
+    """Registra a un usuario como integrante de un proyecto (REQ-02).
+
+    Devuelve los metadatos del proyecto, o None si el codigo no existe.
+    """
+    proyecto = buscar_proyecto_por_codigo(codigo)
+    if proyecto is None:
+        return None
+
+    id_proyecto = proyecto["PK"].split("#", 1)[1]
+    tabla = obtener_tabla()
+    tabla.put_item(Item={
+        "PK": f"PROYECTO#{id_proyecto}",
+        "SK": f"MIEMBRO#{id_usuario}",
+        "nombre_usuario": nombre_usuario,
+        "rol": "integrante",
+        "fecha_vinculacion": _ahora(),
+    })
+    return proyecto
