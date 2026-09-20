@@ -1,11 +1,15 @@
 """Operaciones sobre la tabla unica de SyncTask CUN."""
-import uuid
-import random
+import secrets
 import string
+import uuid
 from datetime import datetime, timezone
+
+from boto3.dynamodb.conditions import Key
+from botocore.exceptions import ClientError
+
 from datos.cliente import obtener_tabla, NOMBRE_TABLA
 
-from datos.cliente import obtener_tabla
+ESTADOS = ("Pendiente", "En progreso", "Terminado")
 
 
 def _ahora():
@@ -14,56 +18,90 @@ def _ahora():
 
 
 def _generar_codigo():
-    """Codigo de acceso de seis caracteres para invitar integrantes (REQ-01)."""
+    """Codigo de acceso de seis caracteres para invitar integrantes (REQ-01).
+
+    Se usa secrets y no random porque el codigo es la unica credencial que
+    protege el acceso a un proyecto: un generador predecible permitiria
+    adivinar codigos ajenos y vulnerar el control de pertenencia (REQ-07).
+    """
     alfabeto = string.ascii_uppercase + string.digits
-    return "".join(random.choices(alfabeto, k=6))
+    return "".join(secrets.choice(alfabeto) for _ in range(6))
 
 
-def crear_proyecto(nombre, descripcion, id_administrador):
-    """Crea un proyecto y su elemento espejo de codigo de acceso (REQ-01).
+# ---------------------------------------------------------------- proyectos
 
-    Escribe dos elementos en una sola transaccion: los metadatos del proyecto
-    y un espejo indexado por codigo, que permite resolver el codigo de acceso
-    con una lectura directa en lugar de recorrer la tabla.
+def crear_proyecto(nombre, descripcion, id_administrador, nombre_administrador):
+    """Crea un proyecto, su espejo de codigo y vincula al administrador (REQ-01).
+
+    Escribe tres elementos en una sola transaccion: los metadatos del proyecto,
+    un espejo indexado por codigo que permite resolver el codigo de acceso con
+    una lectura directa en lugar de recorrer la tabla, y el registro MIEMBRO
+    del creador, necesario para que la validacion de pertenencia (REQ-07) lo
+    reconozca desde el primer momento.
+
+    Si el codigo generado ya existe, la transaccion se cancela y se reintenta
+    con un codigo nuevo, hasta tres veces.
     """
     tabla = obtener_tabla()
     cliente = tabla.meta.client
     id_proyecto = str(uuid.uuid4())
-    codigo = _generar_codigo()
-    momento = _ahora()
 
-    metadatos = {
-        "PK": f"PROYECTO#{id_proyecto}",
-        "SK": "METADATOS",
-        "nombre": nombre,
-        "descripcion": descripcion,
-        "codigo_acceso": codigo,
-        "administrador": id_administrador,
-        "fecha_creacion": momento,
-    }
+    for intento in range(3):
+        codigo = _generar_codigo()
+        momento = _ahora()
 
-    espejo = {
-        "PK": f"CODIGO#{codigo}",
-        "SK": "PROYECTO",
-        "id_proyecto": id_proyecto,
-        "fecha_creacion": momento,
-    }
+        metadatos = {
+            "PK": f"PROYECTO#{id_proyecto}",
+            "SK": "METADATOS",
+            "nombre": nombre,
+            "descripcion": descripcion,
+            "codigo_acceso": codigo,
+            "administrador": id_administrador,
+            "fecha_creacion": momento,
+        }
 
-    cliente.transact_write_items(
-        TransactItems=[
-            {"Put": {
-                "TableName": NOMBRE_TABLA,
-                "Item": metadatos,
-                "ConditionExpression": "attribute_not_exists(PK)",
-            }},
-            {"Put": {
-                "TableName": NOMBRE_TABLA,
-                "Item": espejo,
-                "ConditionExpression": "attribute_not_exists(PK)",
-            }},
-        ]
-    )
-    return metadatos
+        espejo = {
+            "PK": f"CODIGO#{codigo}",
+            "SK": "PROYECTO",
+            "id_proyecto": id_proyecto,
+            "fecha_creacion": momento,
+        }
+
+        miembro = {
+            "PK": f"PROYECTO#{id_proyecto}",
+            "SK": f"MIEMBRO#{id_administrador}",
+            "nombre_usuario": nombre_administrador,
+            "rol": "administrador",
+            "fecha_vinculacion": momento,
+        }
+
+        try:
+            cliente.transact_write_items(
+                TransactItems=[
+                    {"Put": {
+                        "TableName": NOMBRE_TABLA,
+                        "Item": metadatos,
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }},
+                    {"Put": {
+                        "TableName": NOMBRE_TABLA,
+                        "Item": espejo,
+                        "ConditionExpression": "attribute_not_exists(PK)",
+                    }},
+                    {"Put": {
+                        "TableName": NOMBRE_TABLA,
+                        "Item": miembro,
+                    }},
+                ]
+            )
+            return metadatos
+        except ClientError as error:
+            if error.response["Error"]["Code"] != "TransactionCanceledException":
+                raise
+            if intento == 2:
+                raise RuntimeError(
+                    "No se pudo generar un codigo de acceso unico en tres intentos."
+                )
 
 
 def buscar_proyecto_por_codigo(codigo):
@@ -88,6 +126,9 @@ def unirse_a_proyecto(codigo, id_usuario, nombre_usuario):
     """Registra a un usuario como integrante de un proyecto (REQ-02).
 
     Devuelve los metadatos del proyecto, o None si el codigo no existe.
+    Si el usuario ya pertenece al proyecto la operacion no lo sobrescribe,
+    para no perder la fecha de vinculacion original ni degradar el rol de
+    un administrador que vuelva a introducir el codigo.
     """
     proyecto = buscar_proyecto_por_codigo(codigo)
     if proyecto is None:
@@ -95,21 +136,51 @@ def unirse_a_proyecto(codigo, id_usuario, nombre_usuario):
 
     id_proyecto = proyecto["PK"].split("#", 1)[1]
     tabla = obtener_tabla()
-    tabla.put_item(Item={
-        "PK": f"PROYECTO#{id_proyecto}",
-        "SK": f"MIEMBRO#{id_usuario}",
-        "nombre_usuario": nombre_usuario,
-        "rol": "integrante",
-        "fecha_vinculacion": _ahora(),
-    })
+
+    try:
+        tabla.put_item(
+            Item={
+                "PK": f"PROYECTO#{id_proyecto}",
+                "SK": f"MIEMBRO#{id_usuario}",
+                "nombre_usuario": nombre_usuario,
+                "rol": "integrante",
+                "fecha_vinculacion": _ahora(),
+            },
+            ConditionExpression="attribute_not_exists(SK)",
+        )
+    except ClientError as error:
+        if error.response["Error"]["Code"] != "ConditionalCheckFailedException":
+            raise
+        # Ya era integrante: se conserva el registro existente.
+
     return proyecto
 
 
+def es_miembro(id_proyecto, id_usuario):
+    """Indica si un usuario pertenece al proyecto (REQ-07).
+
+    Se consulta antes de cada operacion de escritura y antes de entregar el
+    tablero, de modo que un usuario ajeno no pueda leer ni modificar tareas
+    de un proyecto que no es suyo.
+    """
+    tabla = obtener_tabla()
+    respuesta = tabla.get_item(
+        Key={"PK": f"PROYECTO#{id_proyecto}", "SK": f"MIEMBRO#{id_usuario}"}
+    )
+    return "Item" in respuesta
 
 
+def listar_integrantes(id_proyecto):
+    """Devuelve los integrantes de un proyecto en una sola consulta."""
+    tabla = obtener_tabla()
+    respuesta = tabla.query(
+        KeyConditionExpression=Key("PK").eq(f"PROYECTO#{id_proyecto}")
+        & Key("SK").begins_with("MIEMBRO#")
+    )
+    return respuesta["Items"]
 
-ESTADOS = ("Pendiente", "En progreso", "Terminado")
 
+# ------------------------------------------------------------------- tareas
 
 def crear_tarea(id_proyecto, titulo, descripcion, responsable, fecha_limite):
     """Crea una tarea en estado Pendiente (REQ-03)."""
@@ -153,7 +224,6 @@ def cambiar_estado(id_proyecto, id_tarea, nuevo_estado):
 
 def listar_tareas(id_proyecto):
     """Devuelve todas las tareas de un proyecto en una sola consulta."""
-    from boto3.dynamodb.conditions import Key
     tabla = obtener_tabla()
     respuesta = tabla.query(
         KeyConditionExpression=Key("PK").eq(f"PROYECTO#{id_proyecto}")
