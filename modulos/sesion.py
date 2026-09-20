@@ -1,137 +1,226 @@
-"""Prueba de concepto de sincronizacion entre sesiones (riesgo R-01).
+"""Registro, autenticacion y perfil de usuario (REQ-08, REQ-11).
 
-Verifica que el mecanismo de publicacion y suscripcion de Flet atraviesa
-el proxy inverso Nginx sobre WebSocket seguro. No usa DynamoDB: su unico
-proposito es medir si un cambio hecho en una sesion se refleja en otra y
-en cuanto tiempo, segun el criterio de aceptacion de REQ-05 (menos de
-tres segundos, sin intervencion del usuario).
+Decisiones de diseño relevantes:
 
-Uso:
-    sudo systemctl stop synctask
-    source ~/venv/bin/activate
-    python3 pubsub_demo.py
+1. Identidad. El usuario se almacena en USUARIO#{uuid} y un elemento espejo
+   CORREO#{correo} resuelve el correo a ese identificador. El espejo se crea
+   en la misma transaccion con attribute_not_exists, de modo que la unicidad
+   del correo queda garantizada por la base de datos y no por una consulta
+   previa sujeta a condiciones de carrera. Es el mismo patron que usa
+   repositorio.crear_proyecto para el codigo de acceso.
 
-Luego abrir https://52-54-228-167.nip.io en dos navegadores distintos.
-Al terminar: Ctrl+C y sudo systemctl start synctask
+2. Minimizacion. Se guardan unicamente nombre, correo institucional y la
+   contraseña derivada, conforme al principio de finalidad declarado en el
+   aviso de privacidad. No se solicita documento, telefono ni ubicacion.
+
+3. Contraseñas. Se deriva con scrypt y sal aleatoria por usuario. La
+   contraseña en texto claro no se escribe nunca en la base de datos ni en
+   los registros de la aplicacion (REQ-11).
+
+4. Autorizacion. El registro se rechaza si el titular no otorga autorizacion
+   expresa para el tratamiento de sus datos. La validacion vive aqui y no
+   solo en la interfaz, para que sea verificable con una prueba automatizada
+   (REQ-08, Ley 1581 de 2012).
 """
 
+import hashlib
+import hmac
+import re
 import secrets
-from datetime import datetime
+import uuid
 
-import flet as ft
+from botocore.exceptions import ClientError
 
-ESTADOS = ("Pendiente", "En progreso", "Terminado")
+from datos.cliente import obtener_tabla, NOMBRE_TABLA
+from datos.repositorio import _ahora
 
-COLORES = {
-    "Pendiente": ft.Colors.ORANGE_100,
-    "En progreso": ft.Colors.BLUE_100,
-    "Terminado": ft.Colors.GREEN_100,
-}
+# Parametros de derivacion. Se almacenan junto al hash para poder
+# endurecerlos en el futuro sin invalidar las cuentas existentes.
+SCRYPT_N = 2 ** 14
+SCRYPT_R = 8
+SCRYPT_P = 1
+SCRYPT_LONGITUD = 64
+LONGITUD_SAL = 16
+
+LONGITUD_MINIMA_CLAVE = 8
+
+PATRON_CORREO = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# Dominio institucional esperado. Se deja como lista para admitir variantes
+# sin tocar la logica; una lista vacia desactiva la comprobacion.
+DOMINIOS_ADMITIDOS = ("cun.edu.co",)
 
 
-def main(page: ft.Page):
-    page.title = "Prueba de sincronizacion - SyncTask CUN"
-    page.padding = 24
-    page.bgcolor = ft.Colors.GREY_50
+class ErrorDeRegistro(Exception):
+    """El registro no cumple una condicion exigida."""
 
-    # Identificador corto para distinguir cada sesion en la bitacora.
-    sesion = secrets.token_hex(2).upper()
 
-    estado_actual = ft.Text(
-        ESTADOS[0], size=28, weight=ft.FontWeight.BOLD, color=ft.Colors.GREEN_900
-    )
-    marco_estado = ft.Container(
-        content=estado_actual,
-        bgcolor=COLORES[ESTADOS[0]],
-        padding=20,
-        border_radius=10,
-        alignment=ft.alignment.center,
-    )
+def _normalizar_correo(correo):
+    return correo.strip().lower()
 
-    bitacora = ft.Column(spacing=2, scroll=ft.ScrollMode.AUTO, height=220)
 
-    def registrar(texto, propio):
-        bitacora.controls.insert(
-            0,
-            ft.Text(
-                texto,
-                size=12,
-                color=ft.Colors.GREY_700 if propio else ft.Colors.BLUE_800,
-                weight=ft.FontWeight.W_600 if not propio else ft.FontWeight.NORMAL,
-            ),
+def _derivar(clave, sal):
+    """Deriva la contraseña con scrypt y devuelve el resultado en hexadecimal."""
+    return hashlib.scrypt(
+        clave.encode("utf-8"),
+        salt=sal,
+        n=SCRYPT_N,
+        r=SCRYPT_R,
+        p=SCRYPT_P,
+        dklen=SCRYPT_LONGITUD,
+    ).hex()
+
+
+def _validar_entrada(nombre, correo, clave, autoriza_tratamiento):
+    """Comprueba las condiciones de registro antes de tocar la base de datos."""
+    if not nombre or not nombre.strip():
+        raise ErrorDeRegistro("El nombre es obligatorio.")
+
+    if not PATRON_CORREO.match(correo):
+        raise ErrorDeRegistro("El correo no tiene un formato valido.")
+
+    if DOMINIOS_ADMITIDOS and not correo.endswith(tuple(
+        f"@{dominio}" for dominio in DOMINIOS_ADMITIDOS
+    )):
+        admitidos = ", ".join(DOMINIOS_ADMITIDOS)
+        raise ErrorDeRegistro(
+            f"Debe registrarse con su correo institucional ({admitidos})."
         )
-        del bitacora.controls[40:]
 
-    def recibir(mensaje):
-        """Se ejecuta en cada sesion suscrita cuando alguien publica."""
-        propio = mensaje["sesion"] == sesion
-        estado_actual.value = mensaje["estado"]
-        marco_estado.bgcolor = COLORES[mensaje["estado"]]
-        etiqueta = "esta sesion" if propio else f"sesion {mensaje['sesion']}"
-        registrar(
-            f"{mensaje['hora']}  {mensaje['estado']}  <- {etiqueta}", propio
+    if len(clave or "") < LONGITUD_MINIMA_CLAVE:
+        raise ErrorDeRegistro(
+            f"La contraseña debe tener al menos {LONGITUD_MINIMA_CLAVE} caracteres."
         )
-        page.update()
 
-    page.pubsub.subscribe(recibir)
-
-    def publicar(e):
-        page.pubsub.send_all({
-            "estado": e.control.data,
-            "sesion": sesion,
-            "hora": datetime.now().strftime("%H:%M:%S.%f")[:-3],
-        })
-
-    botones = ft.Row(
-        [
-            ft.ElevatedButton(
-                estado,
-                data=estado,
-                on_click=publicar,
-                bgcolor=COLORES[estado],
-                color=ft.Colors.BLACK87,
-            )
-            for estado in ESTADOS
-        ],
-        spacing=10,
-        wrap=True,
-    )
-
-    page.add(
-        ft.Row(
-            [
-                ft.Icon(ft.Icons.SYNC, color=ft.Colors.GREEN_800),
-                ft.Text(
-                    "Prueba de sincronizacion entre sesiones",
-                    size=18,
-                    weight=ft.FontWeight.BOLD,
-                ),
-            ],
-            spacing=10,
-        ),
-        ft.Text(
-            f"Identificador de esta sesion: {sesion}",
-            size=12,
-            color=ft.Colors.GREY_600,
-        ),
-        ft.Divider(),
-        ft.Text("Estado compartido de la tarea de prueba", size=13),
-        marco_estado,
-        ft.Container(height=8),
-        botones,
-        ft.Container(height=8),
-        ft.Text("Bitacora de eventos recibidos", size=13),
-        ft.Container(
-            content=bitacora,
-            bgcolor=ft.Colors.WHITE,
-            border=ft.border.all(1, ft.Colors.GREY_300),
-            border_radius=8,
-            padding=12,
-        ),
-    )
-
-    registrar(f"{datetime.now().strftime('%H:%M:%S')}  sesion iniciada", True)
-    page.update()
+    # REQ-08: sin autorizacion expresa del titular no se crea la cuenta.
+    if not autoriza_tratamiento:
+        raise ErrorDeRegistro(
+            "Para crear la cuenta debe autorizar el tratamiento de sus datos "
+            "personales en los terminos del aviso de privacidad."
+        )
 
 
-ft.run(main, view=ft.AppView.WEB_BROWSER, port=8550, host="0.0.0.0")
+def registrar_usuario(nombre, correo, clave, autoriza_tratamiento):
+    """Crea una cuenta y su espejo de correo en una sola transaccion (REQ-08).
+
+    Devuelve el perfil creado, sin la contraseña derivada ni la sal.
+    Lanza ErrorDeRegistro si la entrada no es valida, si falta la
+    autorizacion del titular o si el correo ya esta registrado.
+    """
+    correo = _normalizar_correo(correo)
+    _validar_entrada(nombre, correo, clave, autoriza_tratamiento)
+
+    tabla = obtener_tabla()
+    cliente = tabla.meta.client
+
+    id_usuario = str(uuid.uuid4())
+    sal = secrets.token_bytes(LONGITUD_SAL)
+    momento = _ahora()
+
+    perfil = {
+        "PK": f"USUARIO#{id_usuario}",
+        "SK": "PERFIL",
+        "id_usuario": id_usuario,
+        "nombre": nombre.strip(),
+        "correo": correo,
+        "clave_derivada": _derivar(clave, sal),
+        "sal": sal.hex(),
+        "parametros_kdf": {
+            "algoritmo": "scrypt",
+            "n": SCRYPT_N,
+            "r": SCRYPT_R,
+            "p": SCRYPT_P,
+            "dklen": SCRYPT_LONGITUD,
+        },
+        "autoriza_tratamiento": True,
+        "fecha_autorizacion": momento,
+        "fecha_creacion": momento,
+    }
+
+    espejo = {
+        "PK": f"CORREO#{correo}",
+        "SK": "USUARIO",
+        "id_usuario": id_usuario,
+        "fecha_creacion": momento,
+    }
+
+    try:
+        cliente.transact_write_items(
+            TransactItems=[
+                {"Put": {
+                    "TableName": NOMBRE_TABLA,
+                    "Item": perfil,
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }},
+                {"Put": {
+                    "TableName": NOMBRE_TABLA,
+                    "Item": espejo,
+                    "ConditionExpression": "attribute_not_exists(PK)",
+                }},
+            ]
+        )
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "TransactionCanceledException":
+            raise ErrorDeRegistro("Ese correo ya tiene una cuenta registrada.")
+        raise
+
+    return _perfil_publico(perfil)
+
+
+def _perfil_publico(elemento):
+    """Devuelve el perfil sin material sensible, apto para la interfaz."""
+    return {
+        "id_usuario": elemento["id_usuario"],
+        "nombre": elemento["nombre"],
+        "correo": elemento["correo"],
+        "fecha_creacion": elemento["fecha_creacion"],
+    }
+
+
+def _buscar_por_correo(correo):
+    """Resuelve un correo al elemento de perfil completo, o None."""
+    tabla = obtener_tabla()
+
+    espejo = tabla.get_item(Key={"PK": f"CORREO#{correo}", "SK": "USUARIO"})
+    if "Item" not in espejo:
+        return None
+
+    id_usuario = espejo["Item"]["id_usuario"]
+    perfil = tabla.get_item(Key={"PK": f"USUARIO#{id_usuario}", "SK": "PERFIL"})
+    return perfil.get("Item")
+
+
+def autenticar(correo, clave):
+    """Verifica las credenciales y devuelve el perfil publico, o None.
+
+    La comparacion usa hmac.compare_digest para no filtrar informacion por
+    el tiempo de respuesta. Se devuelve None tanto si el correo no existe
+    como si la contraseña no coincide, de modo que la interfaz no revele
+    cual de los dos campos fallo.
+    """
+    elemento = _buscar_por_correo(_normalizar_correo(correo))
+    if elemento is None:
+        return None
+
+    parametros = elemento.get("parametros_kdf", {})
+    derivada = hashlib.scrypt(
+        (clave or "").encode("utf-8"),
+        salt=bytes.fromhex(elemento["sal"]),
+        n=int(parametros.get("n", SCRYPT_N)),
+        r=int(parametros.get("r", SCRYPT_R)),
+        p=int(parametros.get("p", SCRYPT_P)),
+        dklen=int(parametros.get("dklen", SCRYPT_LONGITUD)),
+    ).hex()
+
+    if not hmac.compare_digest(derivada, elemento["clave_derivada"]):
+        return None
+
+    return _perfil_publico(elemento)
+
+
+def obtener_usuario(id_usuario):
+    """Devuelve el perfil publico de un usuario por su identificador."""
+    tabla = obtener_tabla()
+    respuesta = tabla.get_item(Key={"PK": f"USUARIO#{id_usuario}", "SK": "PERFIL"})
+    elemento = respuesta.get("Item")
+    return _perfil_publico(elemento) if elemento else None
