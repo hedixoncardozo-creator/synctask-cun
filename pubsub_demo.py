@@ -45,7 +45,6 @@ def main(page: ft.Page):
         bgcolor=COLORES[ESTADOS[0]],
         padding=20,
         border_radius=10,
-        alignment=ft.alignment.center,
     )
 
     bitacora = ft.Column(spacing=2, scroll=ft.ScrollMode.AUTO, height=220)
@@ -124,7 +123,6 @@ def main(page: ft.Page):
         ft.Container(
             content=bitacora,
             bgcolor=ft.Colors.WHITE,
-            border=ft.border.all(1, ft.Colors.GREY_300),
             border_radius=8,
             padding=12,
         ),
