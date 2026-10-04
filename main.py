@@ -156,7 +156,7 @@ def barra(page, estado, texto, con_volver=False, ruta_de_regreso=None):
         principal = ft.IconButton(
             icon=ft.Icons.ARROW_BACK,
             tooltip="Volver",
-            on_click=lambda e: page.go(ruta_de_regreso or "/proyectos"),
+            on_click=lambda e: page.navigate(ruta_de_regreso or "/proyectos"),
         )
     return ft.AppBar(
         leading=principal,
@@ -174,7 +174,7 @@ def cerrar_sesion(page, estado):
     estado.usuario = None
     estado.id_proyecto = None
     estado.proyecto = None
-    page.go("/")
+    page.navigate("/")
 
 
 def soltar_suscripcion(page, estado):
@@ -220,7 +220,7 @@ def vista_ingreso(page, estado):
             mostrar("El correo o la contrasena no coinciden.")
             return
         estado.usuario = usuario
-        page.go("/proyectos")
+        page.navigate("/proyectos")
 
     clave.on_submit = entrar
 
@@ -244,7 +244,7 @@ def vista_ingreso(page, estado):
                     ),
                     ft.TextButton(
                         content="No tengo cuenta, quiero registrarme",
-                        on_click=lambda e: page.go("/registro"),
+                        on_click=lambda e: page.navigate("/registro"),
                     ),
                 ]
             )
@@ -324,7 +324,7 @@ def vista_registro(page, estado):
             return
         estado.usuario = usuario
         avisar(page, "Cuenta creada. Bienvenido.", ft.Colors.GREEN_700)
-        page.go("/proyectos")
+        page.navigate("/proyectos")
 
     return ft.View(
         route="/registro",
@@ -397,7 +397,7 @@ def vista_proyectos(page, estado):
                         ),
                         subtitle=ft.Text(value=elemento.get("rol", ""), size=11),
                         trailing=ft.Icon(ft.Icons.CHEVRON_RIGHT),
-                        on_click=lambda e, i=id_proyecto: page.go(f"/tablero/{i}"),
+                        on_click=lambda e, i=id_proyecto: page.navigate(f"/tablero/{i}"),
                     ),
                 )
             )
@@ -413,7 +413,7 @@ def vista_proyectos(page, estado):
             return
         codigo.value = ""
         avisar(page, f"Se vinculo a {proyecto.get('nombre', 'el proyecto')}.", ft.Colors.GREEN_700)
-        page.go("/tablero/" + proyecto["PK"].split("#", 1)[1])
+        page.navigate("/tablero/" + proyecto["PK"].split("#", 1)[1])
 
     def crear(e):
         try:
@@ -431,7 +431,7 @@ def vista_proyectos(page, estado):
             f"Proyecto creado. Codigo para invitar: {proyecto.get('codigo_acceso', '')}",
             ft.Colors.GREEN_700,
         )
-        page.go("/tablero/" + proyecto["PK"].split("#", 1)[1])
+        page.navigate("/tablero/" + proyecto["PK"].split("#", 1)[1])
 
     pintar_lista()
 
@@ -600,7 +600,7 @@ def vista_tablero(page, estado, id_proyecto):
                     ft.TextButton(
                         content=f"Comentarios ({n_comentarios})",
                         icon=ft.Icons.COMMENT,
-                        on_click=lambda e, i=id_tarea: page.go(
+                        on_click=lambda e, i=id_tarea: page.navigate(
                             f"/tarea/{id_proyecto}/{i}"
                         ),
                     ),
@@ -1109,18 +1109,30 @@ def main(page: ft.Page):
     # WCAG 2.1 nivel AA (defecto D-07).
     page.theme_mode = ft.ThemeMode.LIGHT
 
-    def al_cambiar_de_ruta(e):
+    def mostrar(vista):
+        page.views = [vista]
+        page.update()
+
+    def al_cambiar_de_ruta(e=None):
+        """Unico punto que modifica page.views.
+
+        Admite ser invocado sin evento. Hace falta para el primer pintado:
+        push_route() le pide al navegador que cambie de direccion y es el
+        navegador quien devuelve el evento, de modo que pedir la ruta en la
+        que ya se esta no produce ningun evento y la pantalla quedaria en
+        blanco. El arranque llama a esta funcion directamente.
+        """
         ruta = page.route or "/"
         partes = [p for p in ruta.split("/") if p]
 
         # Ninguna pantalla distinta del ingreso y el registro se construye sin
         # usuario autenticado: una direccion escrita a mano no debe conceder
-        # acceso (REQ-07, REQ-11).
+        # acceso (REQ-07, REQ-11). Se navega en lugar de pintar el ingreso en
+        # el sitio para que la direccion del navegador no siga anunciando una
+        # pantalla que no se esta mostrando.
         if not estado.usuario and ruta not in ("/", "/registro"):
-            page.views.clear()
-            page.views.append(vista_ingreso(page, estado))
-            page.route = "/"
-            page.update()
+            soltar_suscripcion(page, estado)
+            page.navigate("/")
             return
 
         vista = None
@@ -1144,19 +1156,21 @@ def main(page: ft.Page):
 
         if vista is None:
             # La pantalla rechazo construirse, casi siempre por falta de
-            # permiso. Se devuelve al usuario a terreno seguro.
+            # permiso. Se devuelve al usuario a terreno seguro, navegando para
+            # que la direccion acompane a lo que se muestra.
             soltar_suscripcion(page, estado)
+            if ruta != "/proyectos":
+                page.navigate("/proyectos")
+                return
             vista = vista_proyectos(page, estado)
 
-        page.views.clear()
-        page.views.append(vista)
-        page.update()
+        mostrar(vista)
 
     def al_volver(e):
         destino = "/proyectos" if estado.usuario else "/"
         if estado.id_proyecto and page.route.startswith("/tarea/"):
             destino = f"/tablero/{estado.id_proyecto}"
-        page.go(destino)
+        page.navigate(destino)
 
     def al_desconectar(e):
         # REQ-10: el cliente web de Flet reintenta la conexion por su cuenta.
@@ -1168,7 +1182,10 @@ def main(page: ft.Page):
     page.on_view_pop = al_volver
     page.on_disconnect = al_desconectar
 
-    page.go(page.route or "/")
+    # Primer pintado. No se navega: la ruta ya es la correcta —sea "/" o un
+    # enlace directo a un tablero— y pedirle al navegador que vaya adonde ya
+    # esta no genera ningun evento.
+    al_cambiar_de_ruta()
 
 
 if __name__ == "__main__":
