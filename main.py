@@ -47,8 +47,16 @@ COLOR_DE_ESTADO = {
     "Terminado": ft.Colors.GREEN_700,
 }
 
-ANCHO_MAXIMO = 460
 SEMILLA = ft.Colors.INDIGO
+
+# Reparto de la columna de contenido sobre la rejilla de doce columnas de
+# ResponsiveRow. En un telefono (xs, por debajo de 576 px) ocupa las doce, es
+# decir el ancho completo; a medida que la pantalla crece toma menos columnas,
+# de modo que en un monitor el texto no se estira hasta volverse incomodo de
+# leer. Flet recalcula esto solo al cambiar el tamano de la ventana o al girar
+# el telefono: no hace falta reconstruir la pantalla, que es lo que borraria
+# un formulario a medio escribir cuando se abre el teclado.
+COLUMNAS = {"xs": 12, "sm": 10, "md": 8, "lg": 6, "xl": 4}
 
 AVISO_DE_PRIVACIDAD = (
     "SyncTask CUN recoge su nombre, su correo institucional y los datos de las "
@@ -95,26 +103,32 @@ def avisar(page, texto, color=ft.Colors.BLUE_GREY_900):
 
 
 def centrar(controles, scroll=True):
-    """Coloca el contenido en una columna estrecha y centrada.
+    """Coloca el contenido en una columna centrada que se adapta a la pantalla.
 
-    La misma vista se abre en un telefono y en un navegador de escritorio; sin
-    un ancho maximo, los campos de texto se estiran hasta volverse incomodos.
+    La misma vista se abre en un telefono de 360 px y en un monitor de 1920.
+    Un ancho fijo resuelve el monitor y rompe el telefono: la columna se sale
+    por la derecha y el usuario pierde los botones, que es justo lo que pasaba
+    antes de esta correccion. ResponsiveRow reparte el ancho disponible sobre
+    una rejilla de doce columnas segun el tamano real de la ventana, de modo
+    que no hay ninguna medida en pixeles que pueda quedarse corta.
+
+    El desplazamiento vertical lo gobierna la vista, no esta columna: anidar
+    una zona desplazable dentro de otra confunde el gesto de arrastre en un
+    telefono.
     """
-    return ft.Row(
+    return ft.ResponsiveRow(
+        alignment=ft.MainAxisAlignment.CENTER,
         controls=[
             ft.Container(
-                width=ANCHO_MAXIMO,
-                padding=ft.Padding.symmetric(horizontal=20, vertical=16),
+                col=COLUMNAS,
+                padding=ft.Padding.symmetric(horizontal=16, vertical=16),
                 content=ft.Column(
                     controls=controles,
                     spacing=14,
                     horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                    scroll=ft.ScrollMode.AUTO if scroll else None,
                 ),
             )
         ],
-        alignment=ft.MainAxisAlignment.CENTER,
-        expand=True,
     )
 
 
@@ -161,7 +175,13 @@ def barra(page, estado, texto, con_volver=False, ruta_de_regreso=None):
     return ft.AppBar(
         leading=principal,
         automatically_imply_leading=False,
-        title=ft.Text(value=texto, size=17, weight=ft.FontWeight.W_600),
+        title=ft.Text(
+            value=texto,
+            size=17,
+            weight=ft.FontWeight.W_600,
+            max_lines=1,
+            overflow=ft.TextOverflow.ELLIPSIS,
+        ),
         center_title=False,
         bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
         actions=acciones,
@@ -250,7 +270,7 @@ def vista_ingreso(page, estado):
             )
         ],
         padding=ft.Padding.all(0),
-        vertical_alignment=ft.MainAxisAlignment.CENTER,
+        scroll=ft.ScrollMode.AUTO,
     )
 
 
@@ -350,6 +370,7 @@ def vista_registro(page, estado):
             )
         ],
         padding=ft.Padding.all(0),
+        scroll=ft.ScrollMode.AUTO,
     )
 
 
@@ -442,6 +463,7 @@ def vista_proyectos(page, estado):
             border_radius=ft.BorderRadius.all(12),
             content=ft.Column(
                 spacing=10,
+                horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 controls=[
                     ft.Text(value=titulo_texto, size=13, weight=ft.FontWeight.BOLD)
                 ]
@@ -487,6 +509,7 @@ def vista_proyectos(page, estado):
             )
         ],
         padding=ft.Padding.all(0),
+        scroll=ft.ScrollMode.AUTO,
     )
 
 
@@ -580,6 +603,8 @@ def vista_tablero(page, estado, id_proyecto):
             ),
             ft.Row(
                 spacing=14,
+                wrap=True,
+                run_spacing=2,
                 controls=[
                     ft.Text(
                         value=tarea.get("responsable", "Sin responsable"),
@@ -593,17 +618,23 @@ def vista_tablero(page, estado, id_proyecto):
                     ),
                 ],
             ),
+            # Los botones se envuelven en lugar de alinearse a los extremos:
+            # en un telefono, dos cambios de estado mas el acceso a los
+            # comentarios no caben en una sola linea y antes quedaban fuera de
+            # la pantalla, sin forma de alcanzarlos.
             ft.Row(
-                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                controls=[
-                    ft.Row(spacing=6, controls=cambios),
+                wrap=True,
+                spacing=6,
+                run_spacing=6,
+                controls=cambios
+                + [
                     ft.TextButton(
                         content=f"Comentarios ({n_comentarios})",
                         icon=ft.Icons.COMMENT,
                         on_click=lambda e, i=id_tarea: page.navigate(
                             f"/tarea/{id_proyecto}/{i}"
                         ),
-                    ),
+                    )
                 ],
             ),
         ]
@@ -753,6 +784,7 @@ def vista_tablero(page, estado, id_proyecto):
     formulario.border_radius = ft.BorderRadius.all(12)
     formulario.content = ft.Column(
         spacing=10,
+        horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
         controls=[
             ft.Text(value="Nueva tarea", size=13, weight=ft.FontWeight.BOLD),
             titulo_tarea,
@@ -793,6 +825,8 @@ def vista_tablero(page, estado, id_proyecto):
         content=ft.Row(
             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
             vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            wrap=True,
+            run_spacing=10,
             controls=[
                 ft.Column(
                     spacing=0,
@@ -828,6 +862,7 @@ def vista_tablero(page, estado, id_proyecto):
         ),
         controls=[centrar([encabezado, formulario, resumen, lista])],
         padding=ft.Padding.all(0),
+        scroll=ft.ScrollMode.AUTO,
     )
     # Se puebla el contenido antes de devolver la vista, para que el enrutador
     # la entregue ya pintada y no haya un parpadeo con el tablero vacio.
@@ -1093,6 +1128,7 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
             )
         ],
         padding=ft.Padding.all(0),
+        scroll=ft.ScrollMode.AUTO,
     )
 
 
