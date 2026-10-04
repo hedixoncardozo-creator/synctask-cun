@@ -230,3 +230,73 @@ def listar_tareas(id_proyecto):
         & Key("SK").begins_with("TAREA#")
     )
     return respuesta["Items"]
+
+
+
+
+# -------------------------------------------------------------- comentarios
+
+# Los comentarios usan el prefijo COMENTARIO# en lugar de anidarse bajo TAREA#,
+# como preveia el modelo de la Entrega 1. Anidarlos hacia que la consulta de
+# tareas (begins_with "TAREA#") devolviera tambien los comentarios mezclados
+# con las tarjetas del tablero. Con un prefijo propio, cada patron de acceso se
+# resuelve con una consulta exacta y sin lecturas desperdiciadas.
+#
+# La clave de ordenamiento incluye un sufijo aleatorio corto ademas de la marca
+# de tiempo. La marca sola admitiria que dos comentarios escritos en el mismo
+# microsegundo compartieran clave, y el segundo sobrescribiria al primero sin
+# aviso. El sufijo elimina esa posibilidad y no altera el orden cronologico,
+# porque la marca de tiempo domina la comparacion lexicografica.
+
+
+def agregar_comentario(id_proyecto, id_tarea, id_autor, nombre_autor, texto):
+    """Agrega un comentario de texto plano a una tarea (REQ-06).
+
+    No existe operacion de edicion ni de borrado: el historial se conserva tal
+    como se escribio, que es lo que permite evidenciar el aporte individual.
+    """
+    if not texto or not texto.strip():
+        raise ValueError("El comentario no puede estar vacio.")
+
+    tabla = obtener_tabla()
+    momento = _ahora()
+    sufijo = secrets.token_hex(2)
+
+    elemento = {
+        "PK": f"PROYECTO#{id_proyecto}",
+        "SK": f"COMENTARIO#{id_tarea}#{momento}#{sufijo}",
+        "id_tarea": id_tarea,
+        "id_autor": id_autor,
+        "nombre_autor": nombre_autor,
+        "texto": texto.strip(),
+        "fecha": momento,
+    }
+    tabla.put_item(Item=elemento)
+    return elemento
+
+
+def listar_comentarios(id_proyecto, id_tarea):
+    """Historial de una tarea en orden cronologico (REQ-06).
+
+    El orden lo garantiza la clave de ordenamiento; no se ordena en memoria.
+    """
+    tabla = obtener_tabla()
+    respuesta = tabla.query(
+        KeyConditionExpression=Key("PK").eq(f"PROYECTO#{id_proyecto}")
+        & Key("SK").begins_with(f"COMENTARIO#{id_tarea}#")
+    )
+    return respuesta["Items"]
+
+
+def listar_comentarios_del_proyecto(id_proyecto):
+    """Todos los comentarios de un proyecto, en una sola consulta.
+
+    Sirve para calcular el numero de comentarios por tarea sin ejecutar una
+    consulta por cada tarjeta del tablero.
+    """
+    tabla = obtener_tabla()
+    respuesta = tabla.query(
+        KeyConditionExpression=Key("PK").eq(f"PROYECTO#{id_proyecto}")
+        & Key("SK").begins_with("COMENTARIO#")
+    )
+    return respuesta["Items"]

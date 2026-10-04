@@ -155,3 +155,15 @@ def resumen(id_proyecto, id_usuario):
         "por_estado": por_estado,
         "por_responsable": por_responsable,
     }
+
+def cancelar_suscripcion(page, id_proyecto):
+    """Cancela la suscripcion de la sesion al tema de un proyecto (REQ-05).
+
+    Debe invocarse al salir del tablero. Sin esta llamada, una sesion que
+    navega a otra pantalla sigue recibiendo los cambios del proyecto e
+    intentando actualizar controles que ya no estan en la pagina, lo que
+    produce errores en el registro y consumo innecesario.
+    """
+    page.pubsub.unsubscribe_topic(tema_de(id_proyecto))
+
+
