@@ -300,3 +300,70 @@ def listar_comentarios_del_proyecto(id_proyecto):
         & Key("SK").begins_with("COMENTARIO#")
     )
     return respuesta["Items"]
+
+
+# ============================================================================
+# PEGAR ESTE BLOQUE AL FINAL DE datos/repositorio.py
+# ============================================================================
+
+# ------------------------------------------- indice de proyectos por usuario
+
+# La tabla no tiene indices secundarios, de modo que no existe forma de
+# preguntar "a que proyectos pertenece este usuario" sin recorrerla entera.
+# Un recorrido completo es inaceptable: su costo crece con el tamano de la
+# tabla, no con el numero de proyectos del usuario.
+#
+# La solucion del diseno de tabla unica es escribir un elemento espejo bajo la
+# clave de particion del usuario. Como el perfil ya vive en USUARIO#{id} con
+# SK PERFIL, anadir SK PROYECTO#{idProyecto} deja ambos patrones de acceso en
+# la misma particion y los resuelve con una sola consulta.
+#
+# El registro autoritativo de la pertenencia sigue siendo el elemento
+# MIEMBRO#{idUsuario} bajo el proyecto, que es el que consulta es_miembro() y
+# por lo tanto el que gobierna el control de acceso (REQ-07). Este espejo es
+# solo un indice de lectura. Si su escritura fallara, el usuario conservaria
+# el acceso al proyecto y bastaria volver a introducir el codigo para
+# reconstruirlo, porque put_item sobreescribe sin error. Es decir: el fallo
+# degrada la comodidad, nunca la correccion ni los permisos.
+
+
+def registrar_proyecto_de_usuario(id_usuario, id_proyecto, nombre_proyecto, rol):
+    """Anade el proyecto al indice de lectura del usuario.
+
+    Es idempotente a proposito: repetir la llamada con los mismos datos deja
+    el elemento igual, lo que permite usarla para reparar un espejo perdido.
+    """
+    tabla = obtener_tabla()
+    elemento = {
+        "PK": f"USUARIO#{id_usuario}",
+        "SK": f"PROYECTO#{id_proyecto}",
+        "id_proyecto": id_proyecto,
+        "nombre_proyecto": nombre_proyecto,
+        "rol": rol,
+        "fecha_vinculacion": _ahora(),
+    }
+    tabla.put_item(Item=elemento)
+    return elemento
+
+
+def listar_proyectos_de_usuario(id_usuario):
+    """Proyectos a los que pertenece el usuario, en una sola consulta."""
+    tabla = obtener_tabla()
+    respuesta = tabla.query(
+        KeyConditionExpression=Key("PK").eq(f"USUARIO#{id_usuario}")
+        & Key("SK").begins_with("PROYECTO#")
+    )
+    return respuesta["Items"]
+
+
+def obtener_proyecto(id_proyecto):
+    """Metadatos de un proyecto, o None si no existe.
+
+    Se usa al entrar al tablero para mostrar el nombre y el codigo de acceso
+    sin depender de lo que trajera la pantalla anterior.
+    """
+    tabla = obtener_tabla()
+    respuesta = tabla.get_item(
+        Key={"PK": f"PROYECTO#{id_proyecto}", "SK": "METADATOS"}
+    )
+    return respuesta.get("Item")
