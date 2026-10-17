@@ -1,11 +1,11 @@
-"""SyncTask CUN - aplicacion completa (REQ-01 a REQ-12).
+"""SyncTask CUN - aplicacion completa (REQ-01 a REQ-13).
 
-Arranque en el servidor: lo gobierna systemd.
+El servicio lo gobierna systemd:
 
     sudo systemctl restart synctask
     journalctl -u synctask -n 50 --no-pager
 
-Cinco decisiones gobiernan este archivo y conviene conocerlas antes de leerlo:
+Seis decisiones gobiernan este archivo y conviene conocerlas antes de leerlo:
 
 1. El estado de la sesion vive dentro de main(). Flet crea una instancia de
    Page por cada navegador conectado y ejecuta main() una vez por cada una,
@@ -35,14 +35,23 @@ Cinco decisiones gobiernan este archivo y conviene conocerlas antes de leerlo:
    se reparte sobre una rejilla de doce columnas segun el tamano real de la
    ventana, de modo que la misma pantalla sirve a un telefono de 360 px y a un
    monitor de 1920 sin que nada se salga ni se estire.
+
+6. Toda escritura en DynamoDB ocurre fuera del hilo de la interfaz. Una
+   escritura dura decenas o cientos de milisegundos, y con mala cobertura
+   mucho mas; si se hiciera en el hilo de la interfaz, la pantalla se quedaria
+   congelada sin explicacion y el usuario volveria a pulsar, duplicando la
+   operacion. El ayudante ejecutar_fuera_del_hilo() es el que sostiene esa
+   regla y a la vez muestra el indicador de espera.
 """
 
+import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import flet as ft
 
-from modulos import comentarios, medicion, proyectos, sesion, tareas
+from modulos import (comentarios, medicion, proyectos, recordar, sesion,
+                     tareas)
 
 # ===========================================================================
 # Sistema visual
@@ -53,8 +62,6 @@ from modulos import comentarios, medicion, proyectos, sesion, tareas
 # la vista, y porque deja que las tarjetas blancas se distingan sin necesidad
 # de sombras. Hay un solo color de acento: cuando todo puede destacar, nada
 # destaca, y el acento se reserva para la accion principal de cada pantalla.
-# Los tres colores de estado son los unicos que compiten con el, y lo hacen en
-# superficies pequenas.
 
 
 class Tono:
@@ -67,30 +74,27 @@ class Tono:
     TINTA_TENUE = "#A8A29E"
     ACENTO = "#4F46E5"
     ACENTO_FONDO = "#EEF2FF"
+    ACENTO_BORDE = "#E0E7FF"
     PELIGRO = "#DC2626"
     PELIGRO_FONDO = "#FEF2F2"
     EXITO = "#15803D"
+    AVISO = "#B45309"
+    AVISO_FONDO = "#FEF3C7"
 
 
 ESTADOS = ("Pendiente", "En progreso", "Terminado")
 
-# Cada estado con su tinta y su fondo. Se guardan juntos para que no exista la
-# posibilidad de emparejar mal un color de texto con un fondo y producir un
-# contraste insuficiente.
 ESTILO_ESTADO = {
     "Pendiente": ("#B45309", "#FEF3C7"),
     "En progreso": ("#1D4ED8", "#DBEAFE"),
     "Terminado": ("#15803D", "#DCFCE7"),
 }
 
-# Reparto de la columna de contenido sobre la rejilla de doce columnas de
-# ResponsiveRow. En un telefono (xs, por debajo de 576 px) ocupa las doce; a
-# medida que la pantalla crece toma menos, de modo que en un monitor el texto
-# no se estira hasta volverse incomodo de leer. Flet lo recalcula solo al
-# cambiar el tamano de la ventana o al girar el telefono, sin reconstruir la
-# pantalla, que es lo que borraria un formulario a medio escribir cuando se
-# abre el teclado.
 COLUMNAS = {"xs": 12, "sm": 10, "md": 8, "lg": 6, "xl": 4}
+
+FILTRO_TODAS = "Todas"
+FILTRO_MIAS = "Mias"
+FILTRO_VENCIDAS = "Vencidas"
 
 AVISO_DE_PRIVACIDAD = (
     "SyncTask CUN recoge su nombre, su correo institucional y los datos de las "
@@ -114,8 +118,15 @@ class Estado:
         self.id_proyecto = None
         self.proyecto = None
         self.suscrito_a = None
-        self.filtro = "Todas"
+        self.filtro = FILTRO_TODAS
         self.refrescar = None
+        self.sin_conexion = False
+        self.banda = None
+        self.preferencias = None
+        self.portapapeles = None
+        # Bucle de eventos de esta sesion. Se captura en main(), que si corre
+        # dentro de el, y permite devolver el control desde un hilo trabajador.
+        self.bucle = None
 
 
 # ===========================================================================
@@ -124,12 +135,6 @@ class Estado:
 
 
 def iniciales(nombre):
-    """Dos letras a partir de un nombre, para el circulo identificador.
-
-    Un circulo con iniciales ocupa lo mismo que un icono generico y dice algo:
-    permite distinguir de un vistazo quien escribio cada comentario sin leer el
-    nombre completo.
-    """
     partes = [p for p in re.split(r"\s+", (nombre or "").strip()) if p]
     if not partes:
         return "?"
@@ -150,12 +155,7 @@ def color_de_persona(nombre):
 
 
 def tiempo_relativo(marca):
-    """Convierte una marca ISO en algo legible: "hace 5 min".
-
-    Una fecha completa en cada comentario es ruido: lo que el lector quiere
-    saber es si esto se dijo hace un momento o la semana pasada. La fecha
-    exacta se conserva en el atributo y se muestra al pasar el cursor.
-    """
+    """Convierte una marca ISO en algo legible: "hace 5 min"."""
     if not marca:
         return ""
     try:
@@ -171,8 +171,7 @@ def tiempo_relativo(marca):
     if segundos < 3600:
         return f"hace {int(segundos // 60)} min"
     if segundos < 86400:
-        horas = int(segundos // 3600)
-        return f"hace {horas} h"
+        return f"hace {int(segundos // 3600)} h"
     dias = int(segundos // 86400)
     if dias == 1:
         return "ayer"
@@ -181,15 +180,70 @@ def tiempo_relativo(marca):
     return momento.strftime("%d/%m/%Y")
 
 
-def avisar(page, texto, color=None):
-    """Mensaje efimero al pie de la pantalla.
+def _fecha_de(tarea):
+    texto_fecha = (tarea.get("fecha_limite") or "").strip()
+    if not texto_fecha:
+        return None
+    try:
+        return datetime.strptime(texto_fecha[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
-    Se construye uno nuevo en cada llamada porque show_dialog rechaza un
-    dialogo que ya esta en la pila.
+
+def esta_vencida(tarea):
+    """Una tarea esta vencida si paso su fecha y no esta terminada.
+
+    Una tarea terminada fuera de plazo ya no es un problema que resolver, de
+    modo que marcarla en rojo solo anadiria ruido a la pantalla.
     """
+    if tarea.get("estado") == "Terminado":
+        return False
+    limite = _fecha_de(tarea)
+    return bool(limite and limite < date.today())
+
+
+def texto_de_plazo(tarea):
+    """Describe el plazo en lenguaje natural: "vence manana", "hace 3 dias"."""
+    limite = _fecha_de(tarea)
+    if not limite:
+        return "", Tono.TINTA_SUAVE
+    dias = (limite - date.today()).days
+    if tarea.get("estado") == "Terminado":
+        return limite.strftime("%d/%m"), Tono.TINTA_SUAVE
+    if dias < -1:
+        return f"vencio hace {abs(dias)} dias", Tono.PELIGRO
+    if dias == -1:
+        return "vencio ayer", Tono.PELIGRO
+    if dias == 0:
+        return "vence hoy", Tono.PELIGRO
+    if dias == 1:
+        return "vence manana", Tono.AVISO
+    if dias <= 3:
+        return f"vence en {dias} dias", Tono.AVISO
+    return limite.strftime("%d/%m"), Tono.TINTA_SUAVE
+
+
+def fecha_valida(texto_fecha):
+    """Una fecha vacia es valida; una escrita a mano tiene que ser real.
+
+    El campo admite teclearla y tambien elegirla en el calendario. Admitir
+    ambas cosas exige comprobar la escrita: sin esta validacion se podia
+    guardar "manana" y el tablero no sabria si esa tarea esta vencida.
+    """
+    texto_fecha = (texto_fecha or "").strip()
+    if not texto_fecha:
+        return True
+    try:
+        datetime.strptime(texto_fecha, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def avisar(page, mensaje, color=None):
     page.show_dialog(
         ft.SnackBar(
-            content=ft.Text(value=texto, color=ft.Colors.WHITE, size=13),
+            content=ft.Text(value=mensaje, color=ft.Colors.WHITE, size=13),
             bgcolor=color or Tono.TINTA,
             duration=3500,
             behavior=ft.SnackBarBehavior.FLOATING,
@@ -199,8 +253,89 @@ def avisar(page, texto, color=None):
     )
 
 
-def centrar(controles):
+def ejecutar_fuera_del_hilo(page, estado, control, etiqueta_espera, trabajo,
+                            al_terminar):
+    """Ejecuta una escritura en otro hilo y muestra que se esta trabajando.
+
+    `trabajo` corre fuera del hilo de la interfaz y no debe tocar controles.
+    `al_terminar(resultado, error)` corre despues, y es el unico que modifica
+    la pantalla.
+
+    El detalle que hace que esto funcione: al_terminar NO se ejecuta en el
+    hilo trabajador, sino que se devuelve al bucle de eventos con
+    call_soon_threadsafe. Hace falta porque page.navigate() programa una tarea
+    asincrona y, fuera del bucle, lanza "no running event loop". Sin esta
+    devolucion, un registro correcto terminaba sin error visible y sin
+    cambiar de pantalla: el fallo mas dificil de diagnosticar de todos, el que
+    no deja rastro.
+    """
+    etiqueta_original = control.content
+    icono_original = control.icon
+    control.disabled = True
+    control.content = etiqueta_espera
+    control.icon = None
+    page.update()
+
+    def devolver(resultado, error):
+        control.disabled = False
+        control.content = etiqueta_original
+        control.icon = icono_original
+        try:
+            al_terminar(resultado, error)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def envoltura():
+        resultado, error = None, None
+        try:
+            resultado = trabajo()
+        except Exception as fallo:  # noqa: BLE001
+            error = fallo
+        bucle = getattr(estado, "bucle", None)
+        if bucle is None:
+            devolver(resultado, error)
+        else:
+            bucle.call_soon_threadsafe(devolver, resultado, error)
+
+    page.run_thread(envoltura)
+
+
+def banda_de_conexion(estado):
+    """Franja que avisa de la perdida de conexion (REQ-10).
+
+    Es una franja persistente y no un mensaje efimero porque la condicion que
+    comunica dura: mientras no haya red, el usuario necesita seguir viendola
+    para entender por que sus cambios no llegan a nadie.
+    """
+    return ft.Container(
+        visible=estado.sin_conexion,
+        padding=ft.Padding.symmetric(horizontal=14, vertical=10),
+        bgcolor=Tono.AVISO_FONDO,
+        border_radius=ft.BorderRadius.all(10),
+        content=ft.Row(
+            spacing=9,
+            vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Icon(ft.Icons.CLOUD_OFF_OUTLINED, size=16, color=Tono.AVISO),
+                ft.Text(
+                    value="Sin conexion. Sus cambios no se estan compartiendo.",
+                    size=12,
+                    weight=ft.FontWeight.W_500,
+                    color=Tono.AVISO,
+                    expand=True,
+                ),
+            ],
+        ),
+    )
+
+
+def centrar(estado, controles):
     """Columna de contenido centrada que se adapta al ancho de la pantalla."""
+    estado.banda = banda_de_conexion(estado)
     return ft.ResponsiveRow(
         alignment=ft.MainAxisAlignment.CENTER,
         controls=[
@@ -208,7 +343,7 @@ def centrar(controles):
                 col=COLUMNAS,
                 padding=ft.Padding.symmetric(horizontal=18, vertical=18),
                 content=ft.Column(
-                    controls=controles,
+                    controls=[estado.banda] + controles,
                     spacing=16,
                     horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                 ),
@@ -217,17 +352,11 @@ def centrar(controles):
     )
 
 
-def tarjeta(contenido, relleno=16):
-    """Superficie blanca con borde fino, sin sombra.
-
-    La sombra es el recurso facil para separar una tarjeta del fondo; un borde
-    de un pixel hace lo mismo con menos ruido visual y se comporta mejor en
-    pantallas pequenas, donde varias sombras juntas ensucian la lectura.
-    """
+def tarjeta(contenido, relleno=16, borde=None, fondo=None):
     return ft.Container(
         padding=ft.Padding.all(relleno),
-        bgcolor=Tono.SUPERFICIE,
-        border=ft.Border.all(1, Tono.BORDE),
+        bgcolor=fondo or Tono.SUPERFICIE,
+        border=ft.Border.all(1, borde or Tono.BORDE),
         border_radius=ft.BorderRadius.all(14),
         content=contenido,
     )
@@ -240,17 +369,13 @@ def texto(valor, tamano=13, peso=ft.FontWeight.W_400, color=None, **extra):
 
 
 def rotulo(valor):
-    """Titulo de seccion: pequeno, espaciado, en tinta suave."""
     return ft.Text(
-        value=valor.upper(),
-        size=10,
-        weight=ft.FontWeight.W_600,
+        value=valor.upper(), size=10, weight=ft.FontWeight.W_600,
         color=Tono.TINTA_TENUE,
     )
 
 
 def campo(etiqueta, **extra):
-    """Campo de texto con el mismo tratamiento en toda la aplicacion."""
     return ft.TextField(
         label=etiqueta,
         border_color=Tono.BORDE,
@@ -296,9 +421,53 @@ def boton_discreto(etiqueta, al_pulsar, icono=None, color=None):
         style=ft.ButtonStyle(
             color=color or Tono.TINTA_SUAVE,
             shape=ft.RoundedRectangleBorder(radius=8),
-            padding=ft.Padding.symmetric(horizontal=10, vertical=8),
+            padding=ft.Padding.symmetric(horizontal=12, vertical=10),
             text_style=ft.TextStyle(size=12, weight=ft.FontWeight.W_500),
         ),
+    )
+
+
+def boton_estado(destino, al_pulsar):
+    """Boton de cambio de estado con forma de boton, no de enlace.
+
+    Antes eran texto de color y varias personas no se daban cuenta de que se
+    podian pulsar. Un contorno y un fondo tenue bastan para que se lean como
+    algo accionable sin competir con la accion principal de la pantalla.
+    """
+    tinta, fondo = ESTILO_ESTADO.get(destino, (Tono.TINTA_SUAVE, Tono.BORDE_TENUE))
+    return ft.Container(
+        padding=ft.Padding.symmetric(horizontal=13, vertical=9),
+        bgcolor=fondo,
+        border_radius=ft.BorderRadius.all(9),
+        ink=True,
+        on_click=al_pulsar,
+        content=ft.Row(
+            spacing=5,
+            tight=True,
+            controls=[
+                ft.Icon(ft.Icons.ARROW_FORWARD, size=12, color=tinta),
+                ft.Text(value=destino, size=12, weight=ft.FontWeight.W_600,
+                        color=tinta),
+            ],
+        ),
+    )
+
+
+def boton_icono(icono, descripcion, al_pulsar, color=None):
+    """Boton de icono con area tactil suficiente.
+
+    Los iconos se dibujan a 18 px pero el area sensible llega a 40, que es el
+    minimo con el que un dedo acierta de forma fiable. Antes eran 15 px sin
+    relleno y habia que apuntar.
+    """
+    return ft.IconButton(
+        icon=icono,
+        icon_size=18,
+        icon_color=color or Tono.TINTA_SUAVE,
+        tooltip=descripcion,
+        on_click=al_pulsar,
+        padding=ft.Padding.all(11),
+        size_constraints=ft.BoxConstraints(min_width=40, min_height=40),
     )
 
 
@@ -306,100 +475,79 @@ def circulo(nombre, medida=16):
     return ft.CircleAvatar(
         radius=medida,
         bgcolor=color_de_persona(nombre),
-        content=ft.Text(
-            value=iniciales(nombre),
-            size=medida * 0.62,
-            weight=ft.FontWeight.W_700,
-            color=ft.Colors.WHITE,
-        ),
+        content=ft.Text(value=iniciales(nombre), size=medida * 0.62,
+                        weight=ft.FontWeight.W_700, color=ft.Colors.WHITE),
     )
 
 
-def insignia_estado(nombre_estado, compacta=False):
-    tinta, fondo = ESTILO_ESTADO.get(nombre_estado, (Tono.TINTA_SUAVE, Tono.BORDE_TENUE))
+def insignia(etiqueta, tinta, fondo, compacta=False):
     return ft.Container(
         padding=ft.Padding.symmetric(horizontal=9, vertical=3),
         bgcolor=fondo,
         border_radius=ft.BorderRadius.all(20),
-        content=ft.Text(
-            value=nombre_estado,
-            size=10 if compacta else 11,
-            weight=ft.FontWeight.W_600,
-            color=tinta,
-        ),
+        content=ft.Text(value=etiqueta, size=10 if compacta else 11,
+                        weight=ft.FontWeight.W_600, color=tinta),
     )
 
 
-def vacio(mensaje, icono=ft.Icons.INBOX_OUTLINED):
-    """Estado vacio: una pantalla sin datos tambien debe decir algo."""
+def insignia_estado(nombre_estado, compacta=False):
+    tinta, fondo = ESTILO_ESTADO.get(nombre_estado,
+                                    (Tono.TINTA_SUAVE, Tono.BORDE_TENUE))
+    return insignia(nombre_estado, tinta, fondo, compacta)
+
+
+def vacio(mensaje, icono=ft.Icons.INBOX_OUTLINED, accion=None):
+    """Estado vacio. Si hay una accion obvia, la ofrece en el mismo sitio."""
+    contenido = [
+        ft.Icon(icono, size=28, color=Tono.TINTA_TENUE),
+        ft.Text(value=mensaje, size=13, color=Tono.TINTA_SUAVE,
+                text_align=ft.TextAlign.CENTER),
+    ]
+    if accion is not None:
+        contenido.append(ft.Container(height=4))
+        contenido.append(accion)
     return ft.Container(
-        padding=ft.Padding.symmetric(horizontal=20, vertical=40),
+        padding=ft.Padding.symmetric(horizontal=20, vertical=36),
         alignment=ft.Alignment.CENTER,
-        content=ft.Column(
-            spacing=10,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            controls=[
-                ft.Icon(icono, size=28, color=Tono.TINTA_TENUE),
-                ft.Text(
-                    value=mensaje,
-                    size=13,
-                    color=Tono.TINTA_SUAVE,
-                    text_align=ft.TextAlign.CENTER,
-                ),
-            ],
-        ),
+        content=ft.Column(spacing=10,
+                          horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                          controls=contenido),
     )
 
 
 def marca_sync(medida=38):
-    """Distintivo de la aplicacion: dos letras en un cuadrado redondeado."""
     return ft.Container(
         width=medida,
         height=medida,
         bgcolor=Tono.ACENTO,
         border_radius=ft.BorderRadius.all(medida * 0.3),
         alignment=ft.Alignment.CENTER,
-        content=ft.Text(
-            value="ST",
-            size=medida * 0.42,
-            weight=ft.FontWeight.W_700,
-            color=ft.Colors.WHITE,
-        ),
+        content=ft.Text(value="ST", size=medida * 0.42,
+                        weight=ft.FontWeight.W_700, color=ft.Colors.WHITE),
     )
 
 
-def barra(page, estado, titulo_texto, con_volver=False, ruta_de_regreso=None):
-    acciones = []
+def barra(page, estado, titulo_texto, con_volver=False, ruta_de_regreso=None,
+          acciones=None):
+    acciones = list(acciones or [])
     if estado.usuario:
         acciones.append(
-            ft.IconButton(
-                icon=ft.Icons.LOGOUT,
-                icon_size=19,
-                icon_color=Tono.TINTA_SUAVE,
-                tooltip="Cerrar sesion",
-                on_click=lambda e: cerrar_sesion(page, estado),
-            )
+            boton_icono(ft.Icons.LOGOUT, "Cerrar sesion",
+                        lambda e: cerrar_sesion(page, estado))
         )
     principal = None
     if con_volver:
-        principal = ft.IconButton(
-            icon=ft.Icons.ARROW_BACK,
-            icon_size=19,
-            icon_color=Tono.TINTA,
-            tooltip="Volver",
-            on_click=lambda e: page.navigate(ruta_de_regreso or "/proyectos"),
+        principal = boton_icono(
+            ft.Icons.ARROW_BACK, "Volver",
+            lambda e: page.navigate(ruta_de_regreso or "/proyectos"),
+            color=Tono.TINTA,
         )
     return ft.AppBar(
         leading=principal,
         automatically_imply_leading=False,
-        title=ft.Text(
-            value=titulo_texto,
-            size=16,
-            weight=ft.FontWeight.W_600,
-            color=Tono.TINTA,
-            max_lines=1,
-            overflow=ft.TextOverflow.ELLIPSIS,
-        ),
+        title=ft.Text(value=titulo_texto, size=16, weight=ft.FontWeight.W_600,
+                      color=Tono.TINTA, max_lines=1,
+                      overflow=ft.TextOverflow.ELLIPSIS),
         center_title=False,
         bgcolor=Tono.SUPERFICIE,
         elevation=0,
@@ -409,8 +557,17 @@ def barra(page, estado, titulo_texto, con_volver=False, ruta_de_regreso=None):
 
 
 def cerrar_sesion(page, estado):
-    """Cierra la sesion y suelta la suscripcion abierta (REQ-11)."""
+    """Cierra la sesion, revoca el testigo y suelta la suscripcion (REQ-11).
+
+    Revocar el testigo es la parte que no se debe olvidar: sin eso, "cerrar
+    sesion" solo borraria el nombre de la pantalla y el dispositivo seguiria
+    teniendo una llave valida.
+    """
     soltar_suscripcion(page, estado)
+    try:
+        recordar.olvidar(estado.preferencias)
+    except Exception:  # noqa: BLE001
+        pass
     estado.usuario = None
     estado.id_proyecto = None
     estado.proyecto = None
@@ -421,7 +578,7 @@ def soltar_suscripcion(page, estado):
     if estado.suscrito_a:
         try:
             tareas.cancelar_suscripcion(page, estado.suscrito_a)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
         estado.suscrito_a = None
     estado.refrescar = None
@@ -438,29 +595,42 @@ def vista_ingreso(page, estado):
     clave = campo("Contrasena", password=True, can_reveal_password=True)
     error = ft.Text(value="", color=Tono.PELIGRO, size=12, visible=False)
 
-    def mostrar(mensaje):
+    def mostrar_error(mensaje):
         error.value = mensaje
         error.visible = bool(mensaje)
         page.update()
 
     def entrar(e):
-        mostrar("")
+        mostrar_error("")
         if not correo.value or not clave.value:
-            mostrar("Escriba su correo y su contrasena.")
+            mostrar_error("Escriba su correo y su contrasena.")
             return
-        try:
-            usuario = sesion.autenticar(correo.value.strip(), clave.value)
-        except Exception as fallo:
-            mostrar(f"No se pudo verificar la cuenta: {fallo}")
-            return
-        if not usuario:
-            # Un mensaje unico para correo inexistente y contrasena incorrecta:
-            # distinguirlos permitiria averiguar que correos estan registrados.
-            mostrar("El correo o la contrasena no coinciden.")
-            return
-        estado.usuario = usuario
-        page.navigate("/proyectos")
 
+        datos = (correo.value.strip(), clave.value)
+
+        def trabajo():
+            usuario = sesion.autenticar(*datos)
+            if usuario:
+                recordar.recordar(estado.preferencias, usuario["id_usuario"])
+            return usuario
+
+        def al_terminar(usuario, fallo):
+            if fallo:
+                mostrar_error(f"No se pudo verificar la cuenta: {fallo}")
+                return
+            if not usuario:
+                # Un mensaje unico para correo inexistente y contrasena
+                # incorrecta: distinguirlos permitiria averiguar que correos
+                # estan registrados.
+                mostrar_error("El correo o la contrasena no coinciden.")
+                return
+            estado.usuario = usuario
+            page.navigate("/proyectos")
+
+        ejecutar_fuera_del_hilo(page, estado, boton_entrar, "Verificando...", trabajo,
+                                al_terminar)
+
+    boton_entrar = boton("Ingresar", entrar, ft.Icons.ARROW_FORWARD)
     clave.on_submit = entrar
 
     return ft.View(
@@ -468,33 +638,25 @@ def vista_ingreso(page, estado):
         bgcolor=Tono.FONDO,
         controls=[
             centrar(
+                estado,
                 [
-                    ft.Container(height=30),
-                    ft.Row(
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        controls=[marca_sync(46)],
-                    ),
+                    ft.Container(height=26),
+                    ft.Row(alignment=ft.MainAxisAlignment.CENTER,
+                           controls=[marca_sync(46)]),
                     ft.Container(height=2),
-                    ft.Text(
-                        value="SyncTask CUN",
-                        size=26,
-                        weight=ft.FontWeight.W_700,
-                        color=Tono.TINTA,
-                        text_align=ft.TextAlign.CENTER,
-                    ),
+                    ft.Text(value="SyncTask CUN", size=26,
+                            weight=ft.FontWeight.W_700, color=Tono.TINTA,
+                            text_align=ft.TextAlign.CENTER),
                     ft.Text(
                         value="Las tareas del equipo, iguales para todos y al instante",
-                        size=13,
-                        color=Tono.TINTA_SUAVE,
-                        text_align=ft.TextAlign.CENTER,
-                    ),
+                        size=13, color=Tono.TINTA_SUAVE,
+                        text_align=ft.TextAlign.CENTER),
                     ft.Container(height=10),
                     tarjeta(
                         ft.Column(
                             spacing=14,
                             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                            controls=[correo, clave, error,
-                                      boton("Ingresar", entrar, ft.Icons.ARROW_FORWARD)],
+                            controls=[correo, clave, error, boton_entrar],
                         ),
                         relleno=18,
                     ),
@@ -504,14 +666,12 @@ def vista_ingreso(page, estado):
                         controls=[
                             ft.Text(value="No tiene cuenta?", size=13,
                                     color=Tono.TINTA_SUAVE),
-                            boton_discreto(
-                                "Registrarse",
-                                lambda e: page.navigate("/registro"),
-                                color=Tono.ACENTO,
-                            ),
+                            boton_discreto("Registrarse",
+                                           lambda e: page.navigate("/registro"),
+                                           color=Tono.ACENTO),
                         ],
                     ),
-                ]
+                ],
             )
         ],
         padding=ft.Padding.all(0),
@@ -528,11 +688,11 @@ def vista_registro(page, estado):
     nombre = campo("Nombre y apellido", autofocus=True)
     correo = campo("Correo institucional", keyboard_type=ft.KeyboardType.EMAIL)
     clave = campo("Contrasena", password=True, can_reveal_password=True)
-    repetir = campo("Repita la contrasena", password=True, can_reveal_password=True)
+    repetir = campo("Repita la contrasena", password=True,
+                    can_reveal_password=True)
     autoriza = ft.Checkbox(
         label="Autorizo el tratamiento de mis datos personales",
-        value=False,
-        active_color=Tono.ACENTO,
+        value=False, active_color=Tono.ACENTO,
         label_style=ft.TextStyle(size=13, color=Tono.TINTA),
     )
     error = ft.Text(value="", color=Tono.PELIGRO, size=12, visible=False)
@@ -544,78 +704,78 @@ def vista_registro(page, estado):
         content=ft.Column(
             spacing=7,
             controls=[
-                ft.Row(
-                    spacing=7,
-                    controls=[
-                        ft.Icon(ft.Icons.SHIELD_OUTLINED, size=15, color=Tono.ACENTO),
-                        ft.Text(value="Aviso de privacidad", size=12,
-                                weight=ft.FontWeight.W_700, color=Tono.ACENTO),
-                    ],
-                ),
-                ft.Text(
-                    value=AVISO_DE_PRIVACIDAD,
-                    size=11,
-                    color="#4338CA",
-                    selectable=True,
-                ),
+                ft.Row(spacing=7, controls=[
+                    ft.Icon(ft.Icons.SHIELD_OUTLINED, size=15, color=Tono.ACENTO),
+                    ft.Text(value="Aviso de privacidad", size=12,
+                            weight=ft.FontWeight.W_700, color=Tono.ACENTO),
+                ]),
+                ft.Text(value=AVISO_DE_PRIVACIDAD, size=11, color="#4338CA",
+                        selectable=True),
             ],
         ),
     )
 
-    def mostrar(mensaje):
+    def mostrar_error(mensaje):
         error.value = mensaje
         error.visible = bool(mensaje)
         page.update()
 
     def registrar(e):
-        mostrar("")
+        mostrar_error("")
         if not nombre.value or not correo.value or not clave.value:
-            mostrar("Complete el nombre, el correo y la contrasena.")
+            mostrar_error("Complete el nombre, el correo y la contrasena.")
             return
         if clave.value != repetir.value:
-            mostrar("Las dos contrasenas no coinciden.")
+            mostrar_error("Las dos contrasenas no coinciden.")
             return
         if len(clave.value) < 8:
-            mostrar("La contrasena debe tener al menos ocho caracteres.")
+            mostrar_error("La contrasena debe tener al menos ocho caracteres.")
             return
         if not autoriza.value:
             # REQ-08: sin autorizacion expresa no se crea la cuenta. La
             # comprobacion se repite en sesion.registrar_usuario, que es la que
             # cuenta; esta solo evita un viaje a la base de datos.
-            mostrar("Debe autorizar el tratamiento de datos para continuar.")
+            mostrar_error("Debe autorizar el tratamiento de datos para continuar.")
             return
-        try:
-            usuario = sesion.registrar_usuario(
-                nombre.value.strip(), correo.value.strip(), clave.value, True
-            )
-        except Exception as fallo:
-            mostrar(str(fallo))
-            return
-        estado.usuario = usuario
-        avisar(page, "Cuenta creada. Bienvenido.", Tono.EXITO)
-        page.navigate("/proyectos")
+
+        datos = (nombre.value.strip(), correo.value.strip(), clave.value)
+
+        def trabajo():
+            usuario = sesion.registrar_usuario(datos[0], datos[1], datos[2], True)
+            recordar.recordar(estado.preferencias, usuario["id_usuario"])
+            return usuario
+
+        def al_terminar(usuario, fallo):
+            if fallo:
+                mostrar_error(str(fallo))
+                return
+            estado.usuario = usuario
+            avisar(page, "Cuenta creada. Bienvenido.", Tono.EXITO)
+            page.navigate("/proyectos")
+
+        ejecutar_fuera_del_hilo(page, estado, boton_crear, "Creando...", trabajo,
+                                al_terminar)
+
+    boton_crear = boton("Crear mi cuenta", registrar, ft.Icons.PERSON_ADD_ALT)
 
     return ft.View(
         route="/registro",
         bgcolor=Tono.FONDO,
-        appbar=barra(page, estado, "Crear cuenta", con_volver=True, ruta_de_regreso="/"),
+        appbar=barra(page, estado, "Crear cuenta", con_volver=True,
+                     ruta_de_regreso="/"),
         controls=[
-            centrar(
-                [
-                    tarjeta(
-                        ft.Column(
-                            spacing=14,
-                            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                            controls=[nombre, correo, clave, repetir],
-                        ),
-                        relleno=18,
-                    ),
-                    aviso,
-                    autoriza,
-                    error,
-                    boton("Crear mi cuenta", registrar, ft.Icons.PERSON_ADD_ALT),
-                ]
-            )
+            centrar(estado, [
+                tarjeta(
+                    ft.Column(spacing=14,
+                              horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                              controls=[nombre, correo, clave, repetir]),
+                    relleno=18,
+                ),
+                aviso,
+                autoriza,
+                error,
+                boton_crear,
+            ])
         ],
         padding=ft.Padding.all(0),
         scroll=ft.ScrollMode.AUTO,
@@ -638,17 +798,15 @@ def vista_proyectos(page, estado):
         lista.controls.clear()
         try:
             mios = proyectos.listar_mios(estado.usuario)
-        except Exception as fallo:
+        except Exception as fallo:  # noqa: BLE001
             lista.controls.append(
                 texto(f"No se pudieron cargar los proyectos: {fallo}", 12,
-                      color=Tono.PELIGRO)
-            )
+                      color=Tono.PELIGRO))
             return
         if not mios:
             lista.controls.append(
-                vacio("Todavia no pertenece a ningun proyecto.\nCree uno o use un codigo.",
-                      ft.Icons.FOLDER_OPEN_OUTLINED)
-            )
+                vacio("Todavia no pertenece a ningun proyecto.",
+                      ft.Icons.FOLDER_OPEN_OUTLINED))
             return
         for elemento in mios:
             id_proyecto = elemento.get("id_proyecto")
@@ -667,29 +825,24 @@ def vista_proyectos(page, estado):
                         vertical_alignment=ft.CrossAxisAlignment.CENTER,
                         controls=[
                             ft.Container(
-                                width=38,
-                                height=38,
+                                width=38, height=38,
                                 bgcolor=color_de_persona(nombre_proyecto),
                                 border_radius=ft.BorderRadius.all(11),
                                 alignment=ft.Alignment.CENTER,
                                 content=ft.Text(
-                                    value=iniciales(nombre_proyecto),
-                                    size=14,
+                                    value=iniciales(nombre_proyecto), size=14,
                                     weight=ft.FontWeight.W_700,
-                                    color=ft.Colors.WHITE,
-                                ),
+                                    color=ft.Colors.WHITE),
                             ),
                             ft.Column(
-                                spacing=2,
-                                expand=True,
+                                spacing=2, expand=True,
                                 controls=[
-                                    texto(nombre_proyecto, 14, ft.FontWeight.W_600,
-                                          max_lines=1,
+                                    texto(nombre_proyecto, 14,
+                                          ft.FontWeight.W_600, max_lines=1,
                                           overflow=ft.TextOverflow.ELLIPSIS),
-                                    texto(
-                                        "Administrador" if es_admin else "Integrante",
-                                        11, color=Tono.TINTA_TENUE,
-                                    ),
+                                    texto("Administrador" if es_admin
+                                          else "Integrante", 11,
+                                          color=Tono.TINTA_TENUE),
                                 ],
                             ),
                             ft.Icon(ft.Icons.CHEVRON_RIGHT, size=20,
@@ -700,32 +853,52 @@ def vista_proyectos(page, estado):
             )
 
     def unirse(e):
-        try:
-            proyecto = proyectos.unirse(codigo.value, estado.usuario)
-        except proyectos.ErrorDeCodigo as fallo:
-            avisar(page, str(fallo), Tono.PELIGRO)
-            return
-        except Exception as fallo:
-            avisar(page, f"No se pudo vincular: {fallo}", Tono.PELIGRO)
-            return
-        codigo.value = ""
-        avisar(page, f"Se vinculo a {proyecto.get('nombre', 'el proyecto')}.", Tono.EXITO)
-        page.navigate("/tablero/" + proyecto["PK"].split("#", 1)[1])
+        valor = codigo.value
+
+        def trabajo():
+            return proyectos.unirse(valor, estado.usuario)
+
+        def al_terminar(proyecto, fallo):
+            if isinstance(fallo, proyectos.ErrorDeCodigo):
+                avisar(page, str(fallo), Tono.PELIGRO)
+                return
+            if fallo:
+                avisar(page, f"No se pudo vincular: {fallo}", Tono.PELIGRO)
+                return
+            codigo.value = ""
+            avisar(page, f"Se vinculo a {proyecto.get('nombre', 'el proyecto')}.",
+                   Tono.EXITO)
+            page.navigate("/tablero/" + proyecto["PK"].split("#", 1)[1])
+
+        ejecutar_fuera_del_hilo(page, estado, boton_unirme, "Buscando...", trabajo,
+                                al_terminar)
 
     def crear(e):
-        try:
-            proyecto = proyectos.crear(nombre.value, descripcion.value, estado.usuario)
-        except ValueError as fallo:
-            avisar(page, str(fallo), Tono.PELIGRO)
-            return
-        except Exception as fallo:
-            avisar(page, f"No se pudo crear el proyecto: {fallo}", Tono.PELIGRO)
-            return
-        nombre.value = ""
-        descripcion.value = ""
-        avisar(page, f"Proyecto creado. Codigo: {proyecto.get('codigo_acceso', '')}",
-               Tono.EXITO)
-        page.navigate("/tablero/" + proyecto["PK"].split("#", 1)[1])
+        datos = (nombre.value, descripcion.value)
+
+        def trabajo():
+            return proyectos.crear(datos[0], datos[1], estado.usuario)
+
+        def al_terminar(proyecto, fallo):
+            if isinstance(fallo, ValueError):
+                avisar(page, str(fallo), Tono.PELIGRO)
+                return
+            if fallo:
+                avisar(page, f"No se pudo crear el proyecto: {fallo}",
+                       Tono.PELIGRO)
+                return
+            nombre.value = ""
+            descripcion.value = ""
+            avisar(page, f"Proyecto creado. Codigo: {proyecto.get('codigo_acceso','')}",
+                   Tono.EXITO)
+            page.navigate("/tablero/" + proyecto["PK"].split("#", 1)[1])
+
+        ejecutar_fuera_del_hilo(page, estado, boton_crear, "Creando...", trabajo,
+                                al_terminar)
+
+    boton_unirme = boton("Unirme", unirse, ft.Icons.GROUP_ADD_OUTLINED,
+                         principal=False)
+    boton_crear = boton("Crear proyecto", crear, ft.Icons.ADD)
 
     pintar_lista()
 
@@ -735,33 +908,22 @@ def vista_proyectos(page, estado):
         appbar=barra(page, estado,
                      f"Hola, {estado.usuario['nombre'].split()[0]}"),
         controls=[
-            centrar(
-                [
-                    rotulo("Mis proyectos"),
-                    lista,
-                    ft.Container(height=6),
-                    rotulo("Unirme con un codigo"),
-                    tarjeta(
-                        ft.Column(
-                            spacing=12,
-                            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                            controls=[codigo,
-                                      boton("Unirme", unirse, ft.Icons.GROUP_ADD_OUTLINED,
-                                            principal=False)],
-                        )
-                    ),
-                    ft.Container(height=6),
-                    rotulo("Crear un proyecto nuevo"),
-                    tarjeta(
-                        ft.Column(
-                            spacing=12,
-                            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                            controls=[nombre, descripcion,
-                                      boton("Crear proyecto", crear, ft.Icons.ADD)],
-                        )
-                    ),
-                ]
-            )
+            centrar(estado, [
+                rotulo("Mis proyectos"),
+                lista,
+                ft.Container(height=6),
+                rotulo("Unirme con un codigo"),
+                tarjeta(ft.Column(
+                    spacing=12,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                    controls=[codigo, boton_unirme])),
+                ft.Container(height=6),
+                rotulo("Crear un proyecto nuevo"),
+                tarjeta(ft.Column(
+                    spacing=12,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                    controls=[nombre, descripcion, boton_crear])),
+            ])
         ],
         padding=ft.Padding.all(0),
         scroll=ft.ScrollMode.AUTO,
@@ -793,17 +955,16 @@ def vista_tablero(page, estado, id_proyecto):
     lista = ft.Column(spacing=10)
     filtros = ft.Row(spacing=7, wrap=True, run_spacing=7)
     formulario = ft.Container(visible=False)
+    panel_invitar = ft.Container(visible=False)
 
     titulo_tarea = campo("Titulo de la tarea")
-    descripcion_tarea = campo("Descripcion (opcional)", multiline=True, min_lines=2)
-    fecha_tarea = campo("Fecha limite", hint_text="AAAA-MM-DD")
+    descripcion_tarea = campo("Descripcion (opcional)", multiline=True,
+                              min_lines=2)
+    fecha_tarea = campo("Fecha limite", hint_text="AAAA-MM-DD o use el calendario")
     responsable_tarea = ft.Dropdown(
-        label="Responsable",
-        options=[],
-        border_color=Tono.BORDE,
-        focused_border_color=Tono.ACENTO,
-        border_radius=ft.BorderRadius.all(10),
-        text_size=14,
+        label="Responsable", options=[],
+        border_color=Tono.BORDE, focused_border_color=Tono.ACENTO,
+        border_radius=ft.BorderRadius.all(10), text_size=14,
         label_style=ft.TextStyle(size=13, color=Tono.TINTA_SUAVE),
         content_padding=ft.Padding.symmetric(horizontal=14, vertical=14),
     )
@@ -811,157 +972,237 @@ def vista_tablero(page, estado, id_proyecto):
     datos = {"tareas": []}
     conteo = {}
 
+    # --- selector de fecha
+    #
+    # La fecha era texto libre y nadie validaba nada: se podia guardar "manana"
+    # y el tablero no sabria que hacer con eso. Con el selector, el formato es
+    # correcto por construccion y ademas se escribe mas rapido en un telefono.
+
+    def fecha_elegida(e):
+        valor = e.control.value
+        fecha_tarea.value = valor.strftime("%Y-%m-%d") if valor else ""
+        page.update()
+
+    def abrir_calendario(e):
+        actual = None
+        if fecha_tarea.value:
+            try:
+                actual = datetime.strptime(fecha_tarea.value, "%Y-%m-%d")
+            except ValueError:
+                actual = None
+        page.show_dialog(
+            ft.DatePicker(
+                value=actual,
+                first_date=datetime(2024, 1, 1),
+                last_date=datetime(2030, 12, 31),
+                help_text="Fecha limite de la tarea",
+                cancel_text="Cancelar",
+                confirm_text="Elegir",
+                on_change=fecha_elegida,
+            )
+        )
+
+    def limpiar_fecha(e):
+        fecha_tarea.value = ""
+        page.update()
+
+    # El calendario va en un boton propio al lado del campo y no dentro de el.
+    # Como sufijo del campo no se dibujaba: un control compuesto ahi dentro no
+    # recibe un ancho util y acaba midiendo cero.
+    fila_fecha = ft.Row(
+        spacing=6,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        controls=[
+            ft.Container(content=fecha_tarea, expand=True),
+            boton_icono(ft.Icons.CALENDAR_MONTH_OUTLINED, "Elegir en el calendario",
+                        abrir_calendario, color=Tono.ACENTO),
+            boton_icono(ft.Icons.BACKSPACE_OUTLINED, "Quitar la fecha",
+                        limpiar_fecha),
+        ],
+    )
+
     def integrantes():
         try:
             from datos import repositorio
 
             return repositorio.listar_integrantes(id_proyecto)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return []
 
     def cargar_responsables():
         responsable_tarea.options = [
             ft.DropdownOption(key=n, text=n)
-            for n in sorted(
-                {i.get("nombre_usuario") or i.get("nombre") or "Sin nombre"
-                 for i in integrantes()}
-            )
+            for n in sorted({i.get("nombre_usuario") or i.get("nombre")
+                             or "Sin nombre" for i in integrantes()})
         ]
         if not responsable_tarea.value and responsable_tarea.options:
             responsable_tarea.value = responsable_tarea.options[0].key
+
+    # --- tarjeta de tarea
 
     def tarjeta_de_tarea(tarea):
         id_tarea = tarea["SK"].split("#", 1)[1]
         estado_actual = tarea.get("estado", "Pendiente")
         n_comentarios = conteo.get(id_tarea, 0)
         responsable = tarea.get("responsable", "")
+        resumen = (tarea.get("descripcion") or "").strip()
+        plazo, color_plazo = texto_de_plazo(tarea)
+        vencida = esta_vencida(tarea)
 
-        destinos = [
-            boton_discreto(
-                d,
-                lambda e, i=id_tarea, x=d: mover(i, x),
-                color=ESTILO_ESTADO.get(d, (Tono.TINTA_SUAVE, ""))[0],
-            )
-            for d in ESTADOS
-            if d != estado_actual
+        encabezado = [
+            texto(tarea.get("titulo", "(sin titulo)"), 14.5,
+                  ft.FontWeight.W_600, expand=True, max_lines=3,
+                  overflow=ft.TextOverflow.ELLIPSIS),
+            insignia_estado(estado_actual, compacta=True),
         ]
 
-        pie = ft.Row(
-            wrap=True,
-            spacing=2,
-            run_spacing=2,
-            controls=destinos
-            + [
-                boton_discreto(
-                    f"Comentarios ({n_comentarios})" if n_comentarios
-                    else "Comentar",
-                    lambda e, i=id_tarea: page.navigate(f"/tarea/{id_proyecto}/{i}"),
-                    ft.Icons.CHAT_BUBBLE_OUTLINE,
-                    color=Tono.ACENTO if n_comentarios else Tono.TINTA_SUAVE,
-                )
-            ],
+        cuerpo = [ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                         vertical_alignment=ft.CrossAxisAlignment.START,
+                         spacing=10, controls=encabezado)]
+
+        # Una linea de la descripcion: antes la tarjeta solo mostraba el
+        # titulo y habia que abrir la tarea para saber de que iba.
+        if resumen:
+            cuerpo.append(
+                texto(resumen, 12, color=Tono.TINTA_SUAVE, max_lines=2,
+                      overflow=ft.TextOverflow.ELLIPSIS))
+
+        meta = [
+            circulo(responsable, 10) if responsable else ft.Container(),
+            texto(responsable or "Sin responsable", 11.5,
+                  color=Tono.TINTA_SUAVE),
+        ]
+        if plazo:
+            meta.append(ft.Container(width=3, height=3, bgcolor=Tono.TINTA_TENUE,
+                                     border_radius=ft.BorderRadius.all(2)))
+            meta.append(
+                ft.Row(spacing=4, tight=True, controls=[
+                    ft.Icon(ft.Icons.SCHEDULE, size=12, color=color_plazo)
+                    if vencida or color_plazo == Tono.AVISO else ft.Container(),
+                    ft.Text(value=plazo, size=11.5, color=color_plazo,
+                            weight=ft.FontWeight.W_600 if vencida
+                            else ft.FontWeight.W_400),
+                ]))
+        cuerpo.append(ft.Row(spacing=8, wrap=True, run_spacing=4,
+                             vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                             controls=meta))
+
+        cuerpo.append(ft.Divider(height=1, thickness=1, color=Tono.BORDE_TENUE))
+        cuerpo.append(
+            ft.Row(
+                wrap=True, spacing=6, run_spacing=6,
+                controls=[
+                    boton_estado(d, lambda e, i=id_tarea, x=d: mover(i, x))
+                    for d in ESTADOS if d != estado_actual
+                ] + [
+                    boton_discreto(
+                        f"Comentarios ({n_comentarios})" if n_comentarios
+                        else "Comentar",
+                        lambda e, i=id_tarea: page.navigate(
+                            f"/tarea/{id_proyecto}/{i}"),
+                        ft.Icons.CHAT_BUBBLE_OUTLINE,
+                        color=Tono.ACENTO if n_comentarios else Tono.TINTA_SUAVE),
+                ],
+            )
         )
 
         return ft.Container(
-            padding=ft.Padding.only(left=16, top=14, right=12, bottom=8),
+            padding=ft.Padding.only(left=16, top=14, right=12, bottom=10),
             bgcolor=Tono.SUPERFICIE,
-            border=ft.Border.all(1, Tono.BORDE),
+            border=ft.Border.all(1, Tono.PELIGRO if vencida else Tono.BORDE),
             border_radius=ft.BorderRadius.all(14),
-            content=ft.Column(
-                spacing=10,
-                controls=[
-                    ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        vertical_alignment=ft.CrossAxisAlignment.START,
-                        spacing=10,
-                        controls=[
-                            texto(tarea.get("titulo", "(sin titulo)"), 14.5,
-                                  ft.FontWeight.W_600, expand=True, max_lines=3,
-                                  overflow=ft.TextOverflow.ELLIPSIS),
-                            insignia_estado(estado_actual, compacta=True),
-                        ],
-                    ),
-                    ft.Row(
-                        spacing=8,
-                        wrap=True,
-                        run_spacing=4,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[
-                            circulo(responsable, 10) if responsable else ft.Container(),
-                            texto(responsable or "Sin responsable", 11.5,
-                                  color=Tono.TINTA_SUAVE),
-                            ft.Container(width=3, height=3, bgcolor=Tono.TINTA_TENUE,
-                                         border_radius=ft.BorderRadius.all(2))
-                            if tarea.get("fecha_limite") else ft.Container(),
-                            texto(tarea.get("fecha_limite", ""), 11.5,
-                                  color=Tono.TINTA_SUAVE),
-                        ],
-                    ),
-                    ft.Divider(height=1, thickness=1, color=Tono.BORDE_TENUE),
-                    pie,
-                ],
-            ),
+            content=ft.Column(spacing=9, controls=cuerpo),
         )
 
+    # --- datos y pintado
+
     def recargar():
-        datos["tareas"] = tareas.listar(id_proyecto, usuario["id_usuario"])
+        datos["tareas"] = tareas.vigentes(
+            tareas.listar(id_proyecto, usuario["id_usuario"]))
         conteo.clear()
         try:
             conteo.update(comentarios.contar_por_tarea(id_proyecto,
                                                        usuario["id_usuario"]))
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
+
+    def pasa_el_filtro(tarea):
+        if estado.filtro == FILTRO_TODAS:
+            return True
+        if estado.filtro == FILTRO_MIAS:
+            return tarea.get("responsable") == usuario["nombre"]
+        if estado.filtro == FILTRO_VENCIDAS:
+            return esta_vencida(tarea)
+        return tarea.get("estado") == estado.filtro
 
     def construir(actualizar):
         por_estado = {e: 0 for e in ESTADOS}
         for t in datos["tareas"]:
             clave = t.get("estado", "Pendiente")
             por_estado[clave] = por_estado.get(clave, 0) + 1
+        n_mias = sum(1 for t in datos["tareas"]
+                     if t.get("responsable") == usuario["nombre"])
+        n_vencidas = sum(1 for t in datos["tareas"] if esta_vencida(t))
+
+        etiquetas = [(FILTRO_TODAS, len(datos["tareas"])),
+                     (FILTRO_MIAS, n_mias)]
+        # El filtro de vencidas solo aparece cuando hay alguna: un filtro que
+        # siempre marca cero es ruido, y cuando aparece llama la atencion justo
+        # en el momento en que importa.
+        if n_vencidas:
+            etiquetas.append((FILTRO_VENCIDAS, n_vencidas))
+        etiquetas += [(e, por_estado.get(e, 0)) for e in ESTADOS]
 
         filtros.controls.clear()
-        for etiqueta in ("Todas",) + ESTADOS:
-            cantidad = (len(datos["tareas"]) if etiqueta == "Todas"
-                        else por_estado.get(etiqueta, 0))
+        for etiqueta, cantidad in etiquetas:
             activo = estado.filtro == etiqueta
-            tinta = (ft.Colors.WHITE if activo
-                     else ESTILO_ESTADO.get(etiqueta, (Tono.TINTA_SUAVE, ""))[0])
-            fondo = (Tono.TINTA if activo else Tono.SUPERFICIE)
+            if etiqueta == FILTRO_VENCIDAS:
+                color_propio = Tono.PELIGRO
+            elif etiqueta in ESTILO_ESTADO:
+                color_propio = ESTILO_ESTADO[etiqueta][0]
+            else:
+                color_propio = Tono.TINTA_SUAVE
             filtros.controls.append(
                 ft.Container(
-                    padding=ft.Padding.symmetric(horizontal=13, vertical=8),
+                    padding=ft.Padding.symmetric(horizontal=13, vertical=9),
                     border_radius=ft.BorderRadius.all(20),
-                    bgcolor=fondo,
+                    bgcolor=Tono.TINTA if activo else Tono.SUPERFICIE,
                     border=ft.Border.all(1, Tono.TINTA if activo else Tono.BORDE),
                     ink=True,
                     on_click=lambda e, f=etiqueta: filtrar(f),
-                    content=ft.Row(
-                        spacing=6,
-                        tight=True,
-                        controls=[
-                            ft.Text(value=etiqueta, size=12,
-                                    weight=ft.FontWeight.W_600, color=tinta),
-                            ft.Text(value=str(cantidad), size=12,
-                                    weight=ft.FontWeight.W_400,
-                                    color=tinta if activo else Tono.TINTA_TENUE),
-                        ],
-                    ),
+                    content=ft.Row(spacing=6, tight=True, controls=[
+                        ft.Text(value=etiqueta, size=12,
+                                weight=ft.FontWeight.W_600,
+                                color=ft.Colors.WHITE if activo else color_propio),
+                        ft.Text(value=str(cantidad), size=12,
+                                color=ft.Colors.WHITE if activo
+                                else Tono.TINTA_TENUE),
+                    ]),
                 )
             )
 
-        visibles = [t for t in datos["tareas"]
-                    if estado.filtro == "Todas" or t.get("estado") == estado.filtro]
+        visibles = [t for t in datos["tareas"] if pasa_el_filtro(t)]
         orden = {e: n for n, e in enumerate(ESTADOS)}
-        visibles.sort(key=lambda t: (orden.get(t.get("estado", "Pendiente"), 9),
+        # Las vencidas primero: es la unica reordenacion que responde a una
+        # urgencia real y no a una preferencia de presentacion.
+        visibles.sort(key=lambda t: (not esta_vencida(t),
+                                     orden.get(t.get("estado", "Pendiente"), 9),
                                      t.get("fecha_limite") or "9999"))
 
         lista.controls.clear()
         if not visibles:
-            lista.controls.append(
-                vacio("Todavia no hay tareas aqui."
-                      if estado.filtro == "Todas"
-                      else f"No hay tareas en {estado.filtro.lower()}.",
-                      ft.Icons.TASK_ALT)
-            )
+            if estado.filtro == FILTRO_TODAS:
+                lista.controls.append(
+                    vacio("Todavia no hay tareas en este proyecto.",
+                          ft.Icons.TASK_ALT,
+                          boton("Crear la primera", alternar_formulario,
+                                ft.Icons.ADD)))
+            else:
+                lista.controls.append(
+                    vacio(f"No hay tareas en «{estado.filtro.lower()}».",
+                          ft.Icons.FILTER_ALT_OUTLINED,
+                          boton_discreto("Ver todas",
+                                         lambda e: filtrar(FILTRO_TODAS))))
         for t in visibles:
             lista.controls.append(tarjeta_de_tarea(t))
 
@@ -984,55 +1225,87 @@ def vista_tablero(page, estado, id_proyecto):
             # cuando el companero *ve* el cambio, de modo que el cronometro
             # para cuando la pantalla ya esta reconstruida (REQ-12).
             medicion.marcar_recepcion(id_proyecto, usuario["id_usuario"])
-        except Exception:
+        except Exception:  # noqa: BLE001
             # Una sesion que ya navego a otra pantalla no debe tumbar el
             # proceso por intentar actualizar controles ausentes.
             pass
 
+    # --- acciones
+
     def mover(id_tarea, destino):
-        medicion.marcar_emision(id_proyecto, usuario["id_usuario"], "cambio_de_estado")
+        medicion.marcar_emision(id_proyecto, usuario["id_usuario"],
+                                "cambio_de_estado")
         try:
             tareas.cambiar_estado(page, id_proyecto, usuario["id_usuario"],
                                   id_tarea, destino)
         except tareas.ErrorDePermiso as fallo:
             avisar(page, str(fallo), Tono.PELIGRO)
             return
-        except Exception as fallo:
+        except Exception as fallo:  # noqa: BLE001
             avisar(page, f"No se pudo mover la tarea: {fallo}", Tono.PELIGRO)
             return
         refrescar_desde_evento()
 
     def alternar_formulario(e):
         formulario.visible = not formulario.visible
+        panel_invitar.visible = False
         if formulario.visible:
             cargar_responsables()
         page.update()
+
+    def alternar_invitar(e):
+        panel_invitar.visible = not panel_invitar.visible
+        formulario.visible = False
+        page.update()
+
+    def copiar_codigo(e):
+        """Copia el codigo al portapapeles del dispositivo.
+
+        Antes el codigo era solo texto seleccionable, lo que en un telefono
+        obliga a mantener pulsado, ajustar la seleccion y copiar. Un toque
+        basta.
+        """
+        try:
+            estado.portapapeles.set(codigo_acceso)
+            avisar(page, "Codigo copiado.", Tono.EXITO)
+        except Exception:  # noqa: BLE001
+            avisar(page, "No se pudo copiar; seleccione el codigo a mano.",
+                   Tono.PELIGRO)
 
     def guardar_tarea(e):
         if not titulo_tarea.value or not titulo_tarea.value.strip():
             avisar(page, "La tarea necesita un titulo.", Tono.PELIGRO)
             return
-        medicion.marcar_emision(id_proyecto, usuario["id_usuario"], "tarea_creada")
-        try:
-            tareas.crear(
-                page, id_proyecto, usuario["id_usuario"],
-                titulo=titulo_tarea.value.strip(),
-                descripcion=(descripcion_tarea.value or "").strip(),
-                responsable=responsable_tarea.value or usuario["nombre"],
-                fecha_limite=(fecha_tarea.value or "").strip(),
-            )
-        except tareas.ErrorDePermiso as fallo:
-            avisar(page, str(fallo), Tono.PELIGRO)
+        if not fecha_valida(fecha_tarea.value):
+            avisar(page, "La fecha debe tener la forma AAAA-MM-DD.", Tono.PELIGRO)
             return
-        except Exception as fallo:
-            avisar(page, f"No se pudo crear la tarea: {fallo}", Tono.PELIGRO)
-            return
-        titulo_tarea.value = ""
-        descripcion_tarea.value = ""
-        fecha_tarea.value = ""
-        formulario.visible = False
-        avisar(page, "Tarea creada.", Tono.EXITO)
-        refrescar_desde_evento()
+        medicion.marcar_emision(id_proyecto, usuario["id_usuario"],
+                                "tarea_creada")
+        campos = (titulo_tarea.value.strip(),
+                  (descripcion_tarea.value or "").strip(),
+                  responsable_tarea.value or usuario["nombre"],
+                  (fecha_tarea.value or "").strip())
+
+        def trabajo():
+            return tareas.crear(page, id_proyecto, usuario["id_usuario"],
+                                titulo=campos[0], descripcion=campos[1],
+                                responsable=campos[2], fecha_limite=campos[3])
+
+        def al_terminar(_, fallo):
+            if fallo:
+                avisar(page, f"No se pudo crear la tarea: {fallo}", Tono.PELIGRO)
+                return
+            titulo_tarea.value = ""
+            descripcion_tarea.value = ""
+            fecha_tarea.value = ""
+            formulario.visible = False
+            avisar(page, "Tarea creada.", Tono.EXITO)
+            refrescar_desde_evento()
+
+        ejecutar_fuera_del_hilo(page, estado, boton_guardar, "Guardando...", trabajo,
+                                al_terminar)
+
+    boton_guardar = boton("Guardar", guardar_tarea, ft.Icons.CHECK)
 
     formulario.padding = ft.Padding.all(16)
     formulario.bgcolor = Tono.SUPERFICIE
@@ -1045,16 +1318,38 @@ def vista_tablero(page, estado, id_proyecto):
             rotulo("Nueva tarea"),
             titulo_tarea,
             responsable_tarea,
-            fecha_tarea,
+            fila_fecha,
             descripcion_tarea,
+            ft.Row(alignment=ft.MainAxisAlignment.END, spacing=6, controls=[
+                boton_discreto("Cancelar", alternar_formulario),
+                boton_guardar,
+            ]),
+        ],
+    )
+
+    panel_invitar.padding = ft.Padding.all(16)
+    panel_invitar.bgcolor = Tono.ACENTO_FONDO
+    panel_invitar.border = ft.Border.all(1, Tono.ACENTO_BORDE)
+    panel_invitar.border_radius = ft.BorderRadius.all(14)
+    panel_invitar.content = ft.Column(
+        spacing=10,
+        controls=[
+            rotulo("Codigo para invitar"),
             ft.Row(
-                alignment=ft.MainAxisAlignment.END,
-                spacing=6,
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                wrap=True,
+                run_spacing=10,
                 controls=[
-                    boton_discreto("Cancelar", alternar_formulario),
-                    boton("Guardar", guardar_tarea, ft.Icons.CHECK),
+                    ft.Text(value=codigo_acceso, size=28,
+                            weight=ft.FontWeight.W_700, color=Tono.ACENTO,
+                            selectable=True),
+                    boton("Copiar", copiar_codigo, ft.Icons.COPY_OUTLINED,
+                          principal=False),
                 ],
             ),
+            texto("Quien tenga este codigo podra unirse al proyecto y ver "
+                  "todas sus tareas.", 11.5, color=Tono.TINTA_SUAVE),
         ],
     )
 
@@ -1067,50 +1362,29 @@ def vista_tablero(page, estado, id_proyecto):
 
     try:
         recargar()
-    except Exception as fallo:
+    except Exception as fallo:  # noqa: BLE001
         avisar(page, f"No se pudieron cargar las tareas: {fallo}", Tono.PELIGRO)
-
-    encabezado = ft.Row(
-        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-        wrap=True,
-        run_spacing=12,
-        controls=[
-            ft.Column(
-                spacing=3,
-                controls=[
-                    rotulo("Codigo para invitar"),
-                    ft.Container(
-                        padding=ft.Padding.symmetric(horizontal=11, vertical=6),
-                        bgcolor=Tono.SUPERFICIE,
-                        border=ft.Border.all(1, Tono.BORDE),
-                        border_radius=ft.BorderRadius.all(9),
-                        content=ft.Text(
-                            value=codigo_acceso,
-                            size=15,
-                            weight=ft.FontWeight.W_700,
-                            color=Tono.TINTA,
-                            selectable=True,
-                        ),
-                    ),
-                ],
-            ),
-            boton("Nueva tarea", alternar_formulario, ft.Icons.ADD),
-        ],
-    )
 
     vista = ft.View(
         route=f"/tablero/{id_proyecto}",
         bgcolor=Tono.FONDO,
         appbar=barra(page, estado, nombre_proyecto, con_volver=True,
-                     ruta_de_regreso="/proyectos"),
-        controls=[centrar([encabezado, formulario, filtros, lista])],
+                     ruta_de_regreso="/proyectos",
+                     acciones=[boton_icono(ft.Icons.PERSON_ADD_ALT_1_OUTLINED,
+                                           "Invitar al proyecto",
+                                           alternar_invitar)]),
+        controls=[
+            centrar(estado, [
+                boton("Nueva tarea", alternar_formulario, ft.Icons.ADD),
+                panel_invitar,
+                formulario,
+                filtros,
+                lista,
+            ])
+        ],
         padding=ft.Padding.all(0),
         scroll=ft.ScrollMode.AUTO,
     )
-    # Se puebla antes de devolver la vista, para que el enrutador la entregue
-    # ya pintada y no haya un parpadeo con el tablero vacio. No se llama a
-    # page.update() porque la vista aun no esta montada en la pagina.
     construir(actualizar=False)
     return vista
 
@@ -1121,12 +1395,11 @@ def vista_tablero(page, estado, id_proyecto):
 
 
 def vista_tarea(page, estado, id_proyecto, id_tarea):
-    """Detalle de una tarea con su hilo de comentarios (REQ-06).
+    """Detalle de una tarea, con edicion, supresion y conversacion (REQ-06).
 
-    El hilo admite edicion y supresion del comentario propio. Ambas se
-    resuelven dentro de la misma burbuja en lugar de abrir un dialogo: en un
-    telefono, un dialogo tapa la conversacion justo cuando el usuario necesita
-    verla para decidir que escribir.
+    La edicion de la tarea y la de los comentarios se resuelven dentro de la
+    propia pantalla, sin dialogos: en un telefono un dialogo tapa aquello
+    sobre lo que se esta decidiendo.
     """
     usuario = estado.usuario
     try:
@@ -1135,24 +1408,239 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
         avisar(page, "No pertenece a ese proyecto.", Tono.PELIGRO)
         return None
 
-    la_tarea = None
-    try:
-        for t in tareas.listar(id_proyecto, usuario["id_usuario"]):
-            if t["SK"].split("#", 1)[1] == id_tarea:
-                la_tarea = t
-                break
-    except Exception as fallo:
-        avisar(page, f"No se pudo cargar la tarea: {fallo}", Tono.PELIGRO)
+    estado_vista = {"tarea": None, "editando": False, "borrando": False}
 
+    def cargar_tarea():
+        try:
+            for t in tareas.vigentes(tareas.listar(id_proyecto,
+                                                   usuario["id_usuario"])):
+                if t["SK"].split("#", 1)[1] == id_tarea:
+                    return t
+        except Exception as fallo:  # noqa: BLE001
+            avisar(page, f"No se pudo cargar la tarea: {fallo}", Tono.PELIGRO)
+        return None
+
+    estado_vista["tarea"] = cargar_tarea()
+    if estado_vista["tarea"] is None:
+        avisar(page, "Esa tarea ya no existe.", Tono.PELIGRO)
+        return None
+
+    ficha = ft.Container()
     hilo = ft.Column(spacing=10)
-    nuevo = campo("Escriba un comentario", multiline=True, min_lines=2, max_lines=6)
+    nuevo = campo("Escriba un comentario", multiline=True, min_lines=2,
+                  max_lines=6)
 
-    # Que comentario se esta editando y cual espera confirmacion de borrado.
-    # Viven fuera de construir_hilo() para que sobrevivan a una reconstruccion
-    # provocada por el mensaje de otra sesion: si no, un companero que comenta
-    # mientras usted edita le borraria el texto a medio escribir.
     edicion = {"clave": None, "borrador": ""}
     confirmando = {"clave": None}
+
+    # --- ficha de la tarea, en sus tres estados
+
+    def ficha_lectura():
+        tarea = estado_vista["tarea"]
+        responsable = tarea.get("responsable", "")
+        plazo, color_plazo = texto_de_plazo(tarea)
+        vencida = esta_vencida(tarea)
+
+        meta = [
+            circulo(responsable, 10) if responsable else ft.Container(),
+            texto(responsable or "Sin responsable", 12, color=Tono.TINTA_SUAVE),
+        ]
+        if plazo:
+            meta.append(ft.Text(value=plazo, size=12, color=color_plazo,
+                                weight=ft.FontWeight.W_600 if vencida
+                                else ft.FontWeight.W_400))
+
+        return tarjeta(
+            ft.Column(spacing=10, controls=[
+                ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                       vertical_alignment=ft.CrossAxisAlignment.START,
+                       spacing=10,
+                       controls=[
+                           texto(tarea.get("titulo", "Tarea"), 17,
+                                 ft.FontWeight.W_700, expand=True),
+                           insignia_estado(tarea.get("estado", "Pendiente")),
+                       ]),
+                ft.Row(spacing=8, wrap=True, run_spacing=4,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                       controls=meta),
+                ft.Divider(height=1, thickness=1, color=Tono.BORDE_TENUE),
+                texto(tarea.get("descripcion", "") or "Sin descripcion.", 13,
+                      color=Tono.TINTA_SUAVE, selectable=True),
+            ]),
+            borde=Tono.PELIGRO if vencida else None,
+        )
+
+    def ficha_edicion():
+        tarea = estado_vista["tarea"]
+        titulo_e = campo("Titulo de la tarea", value=tarea.get("titulo", ""),
+                         autofocus=True)
+        descripcion_e = campo("Descripcion", value=tarea.get("descripcion", ""),
+                              multiline=True, min_lines=2)
+        fecha_e = campo("Fecha limite", value=tarea.get("fecha_limite", ""),
+                        hint_text="AAAA-MM-DD o use el calendario")
+
+        try:
+            from datos import repositorio
+
+            nombres = sorted({i.get("nombre_usuario") or i.get("nombre")
+                              or "Sin nombre"
+                              for i in repositorio.listar_integrantes(id_proyecto)})
+        except Exception:  # noqa: BLE001
+            nombres = []
+        if tarea.get("responsable") and tarea["responsable"] not in nombres:
+            nombres.append(tarea["responsable"])
+        responsable_e = ft.Dropdown(
+            label="Responsable",
+            value=tarea.get("responsable") or (nombres[0] if nombres else None),
+            options=[ft.DropdownOption(key=n, text=n) for n in nombres],
+            border_color=Tono.BORDE, focused_border_color=Tono.ACENTO,
+            border_radius=ft.BorderRadius.all(10), text_size=14,
+            label_style=ft.TextStyle(size=13, color=Tono.TINTA_SUAVE),
+            content_padding=ft.Padding.symmetric(horizontal=14, vertical=14),
+        )
+
+        def fecha_elegida(e):
+            valor = e.control.value
+            fecha_e.value = valor.strftime("%Y-%m-%d") if valor else ""
+            page.update()
+
+        def abrir_calendario(e):
+            actual = None
+            if fecha_e.value:
+                try:
+                    actual = datetime.strptime(fecha_e.value, "%Y-%m-%d")
+                except ValueError:
+                    actual = None
+            page.show_dialog(ft.DatePicker(
+                value=actual, first_date=datetime(2024, 1, 1),
+                last_date=datetime(2030, 12, 31),
+                help_text="Fecha limite de la tarea", cancel_text="Cancelar",
+                confirm_text="Elegir", on_change=fecha_elegida))
+
+        fila_fecha_e = ft.Row(
+            spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER,
+            controls=[
+                ft.Container(content=fecha_e, expand=True),
+                boton_icono(ft.Icons.CALENDAR_MONTH_OUTLINED,
+                            "Elegir en el calendario", abrir_calendario,
+                            color=Tono.ACENTO),
+                boton_icono(ft.Icons.BACKSPACE_OUTLINED, "Quitar la fecha",
+                            lambda e: (setattr(fecha_e, "value", ""),
+                                       page.update())),
+            ])
+
+        def guardar(e):
+            if not titulo_e.value or not titulo_e.value.strip():
+                avisar(page, "La tarea necesita un titulo.", Tono.PELIGRO)
+                return
+            if not fecha_valida(fecha_e.value):
+                avisar(page, "La fecha debe tener la forma AAAA-MM-DD.",
+                       Tono.PELIGRO)
+                return
+            medicion.marcar_emision(id_proyecto, usuario["id_usuario"],
+                                    "tarea_editada")
+            campos = (titulo_e.value, descripcion_e.value,
+                      responsable_e.value, fecha_e.value)
+
+            def trabajo():
+                return tareas.editar(page, id_proyecto, usuario["id_usuario"],
+                                     id_tarea, titulo=campos[0],
+                                     descripcion=campos[1],
+                                     responsable=campos[2],
+                                     fecha_limite=campos[3])
+
+            def al_terminar(tarea_nueva, fallo):
+                if fallo:
+                    avisar(page, f"No se pudo guardar: {fallo}", Tono.PELIGRO)
+                    return
+                estado_vista["tarea"] = tarea_nueva
+                estado_vista["editando"] = False
+                avisar(page, "Tarea actualizada.", Tono.EXITO)
+                repintar()
+
+            ejecutar_fuera_del_hilo(page, estado, boton_guardar_tarea, "Guardando...",
+                                    trabajo, al_terminar)
+
+        boton_guardar_tarea = boton("Guardar cambios", guardar, ft.Icons.CHECK)
+
+        return tarjeta(
+            ft.Column(spacing=12,
+                      horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                      controls=[
+                          rotulo("Editar tarea"),
+                          titulo_e, responsable_e, fila_fecha_e,
+                          descripcion_e,
+                          ft.Row(alignment=ft.MainAxisAlignment.END, spacing=6,
+                                 controls=[
+                                     boton_discreto("Cancelar",
+                                                    lambda e: cancelar_edicion_tarea()),
+                                     boton_guardar_tarea,
+                                 ]),
+                      ]),
+            borde=Tono.ACENTO,
+        )
+
+    def ficha_borrado():
+        def confirmar(e):
+            def trabajo():
+                return tareas.eliminar(page, id_proyecto,
+                                       usuario["id_usuario"], id_tarea)
+
+            def al_terminar(_, fallo):
+                if fallo:
+                    avisar(page, f"No se pudo eliminar: {fallo}", Tono.PELIGRO)
+                    return
+                avisar(page, "Tarea eliminada.", Tono.TINTA)
+                page.navigate(f"/tablero/{id_proyecto}")
+
+            ejecutar_fuera_del_hilo(page, estado, boton_eliminar_tarea, "Eliminando...",
+                                    trabajo, al_terminar)
+
+        boton_eliminar_tarea = boton("Eliminar la tarea", confirmar,
+                                     ft.Icons.DELETE_OUTLINE, peligro=True)
+
+        return tarjeta(
+            ft.Column(spacing=12, controls=[
+                rotulo("Eliminar tarea"),
+                texto("La tarea desaparecera del tablero para todo el equipo. "
+                      "La conversacion se conserva, pero dejara de ser "
+                      "accesible desde el tablero.", 13, color=Tono.PELIGRO),
+                ft.Row(alignment=ft.MainAxisAlignment.END, spacing=6, controls=[
+                    boton_discreto("Conservar",
+                                   lambda e: cancelar_borrado_tarea()),
+                    boton_eliminar_tarea,
+                ]),
+            ]),
+            borde=Tono.PELIGRO, fondo=Tono.PELIGRO_FONDO,
+        )
+
+    def construir_ficha():
+        if estado_vista["borrando"]:
+            ficha.content = ficha_borrado()
+        elif estado_vista["editando"]:
+            ficha.content = ficha_edicion()
+        else:
+            ficha.content = ficha_lectura()
+
+    def empezar_edicion_tarea(e=None):
+        estado_vista["editando"] = True
+        estado_vista["borrando"] = False
+        repintar()
+
+    def cancelar_edicion_tarea():
+        estado_vista["editando"] = False
+        repintar()
+
+    def pedir_borrado_tarea(e=None):
+        estado_vista["borrando"] = True
+        estado_vista["editando"] = False
+        repintar()
+
+    def cancelar_borrado_tarea():
+        estado_vista["borrando"] = False
+        repintar()
+
+    # --- hilo de comentarios
 
     def burbuja(comentario):
         clave = comentario["SK"]
@@ -1160,176 +1648,129 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
         es_mio = comentario.get("id_autor") == usuario["id_usuario"]
         suprimido = comentarios.esta_eliminado(comentario)
 
-        cabecera = ft.Row(
-            spacing=8,
-            vertical_alignment=ft.CrossAxisAlignment.CENTER,
-            controls=[
-                circulo(autor, 13),
-                texto(autor, 12.5, ft.FontWeight.W_600),
-                texto(tiempo_relativo(comentario.get("fecha")), 11,
-                      color=Tono.TINTA_TENUE,
-                      tooltip=str(comentario.get("fecha", ""))[:19].replace("T", " ")),
-            ],
-        )
+        cabecera = ft.Row(spacing=8,
+                          vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                          controls=[
+                              circulo(autor, 13),
+                              texto(autor, 12.5, ft.FontWeight.W_600),
+                              texto(tiempo_relativo(comentario.get("fecha")), 11,
+                                    color=Tono.TINTA_TENUE,
+                                    tooltip=str(comentario.get("fecha", ""))[:19]
+                                    .replace("T", " ")),
+                          ])
         if comentarios.fue_editado(comentario) and not suprimido:
-            cabecera.controls.append(
-                texto("· editado", 11, color=Tono.TINTA_TENUE)
-            )
+            cabecera.controls.append(texto("· editado", 11,
+                                           color=Tono.TINTA_TENUE))
 
-        # --- comentario suprimido
         if suprimido:
             return ft.Container(
-                padding=ft.Padding.all(13),
-                bgcolor=Tono.BORDE_TENUE,
+                padding=ft.Padding.all(13), bgcolor=Tono.BORDE_TENUE,
                 border_radius=ft.BorderRadius.all(12),
-                content=ft.Column(
-                    spacing=5,
-                    controls=[
-                        cabecera,
-                        ft.Text(
-                            value=comentarios.LEYENDA_ELIMINADO,
-                            size=12.5,
-                            italic=True,
-                            color=Tono.TINTA_TENUE,
-                        ),
-                    ],
-                ),
-            )
+                content=ft.Column(spacing=5, controls=[
+                    cabecera,
+                    ft.Text(value=comentarios.LEYENDA_ELIMINADO, size=12.5,
+                            italic=True, color=Tono.TINTA_TENUE),
+                ]))
 
-        # --- en edicion
         if edicion["clave"] == clave:
             editor = campo("", multiline=True, min_lines=2, max_lines=6,
                            value=edicion["borrador"], autofocus=True)
-
-            def anotar(e):
-                edicion["borrador"] = e.control.value
-
-            editor.on_change = anotar
+            editor.on_change = lambda e: edicion.__setitem__("borrador",
+                                                             e.control.value)
             return ft.Container(
-                padding=ft.Padding.all(13),
-                bgcolor=Tono.ACENTO_FONDO,
+                padding=ft.Padding.all(13), bgcolor=Tono.ACENTO_FONDO,
                 border=ft.Border.all(1, Tono.ACENTO),
                 border_radius=ft.BorderRadius.all(12),
                 content=ft.Column(
                     spacing=10,
                     horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
                     controls=[
-                        cabecera,
-                        editor,
-                        ft.Row(
-                            alignment=ft.MainAxisAlignment.END,
-                            spacing=6,
-                            controls=[
-                                boton_discreto("Cancelar", lambda e: cancelar_edicion()),
-                                boton("Guardar", lambda e, c=clave: guardar_edicion(c),
-                                      ft.Icons.CHECK),
-                            ],
-                        ),
-                    ],
-                ),
-            )
+                        cabecera, editor,
+                        ft.Row(alignment=ft.MainAxisAlignment.END, spacing=6,
+                               controls=[
+                                   boton_discreto("Cancelar",
+                                                  lambda e: cancelar_edicion()),
+                                   boton("Guardar",
+                                         lambda e, c=clave: guardar_edicion(c),
+                                         ft.Icons.CHECK),
+                               ]),
+                    ]))
 
-        # --- esperando confirmacion de borrado
         if confirmando["clave"] == clave:
             return ft.Container(
-                padding=ft.Padding.all(13),
-                bgcolor=Tono.PELIGRO_FONDO,
+                padding=ft.Padding.all(13), bgcolor=Tono.PELIGRO_FONDO,
                 border=ft.Border.all(1, Tono.PELIGRO),
                 border_radius=ft.BorderRadius.all(12),
-                content=ft.Column(
-                    spacing=10,
-                    controls=[
-                        cabecera,
-                        texto("Se eliminara el contenido. Quedara constancia de que "
-                              "usted participo, pero el texto no se podra recuperar.",
-                              12.5, color=Tono.PELIGRO),
-                        ft.Row(
-                            alignment=ft.MainAxisAlignment.END,
-                            spacing=6,
-                            controls=[
-                                boton_discreto("Conservar",
-                                               lambda e: cancelar_confirmacion()),
-                                boton("Eliminar",
-                                      lambda e, c=clave: confirmar_borrado(c),
-                                      ft.Icons.DELETE_OUTLINE, peligro=True),
-                            ],
-                        ),
-                    ],
-                ),
-            )
+                content=ft.Column(spacing=10, controls=[
+                    cabecera,
+                    texto("Se eliminara el contenido. Quedara constancia de que "
+                          "usted participo, pero el texto no se podra recuperar.",
+                          12.5, color=Tono.PELIGRO),
+                    ft.Row(alignment=ft.MainAxisAlignment.END, spacing=6,
+                           controls=[
+                               boton_discreto("Conservar",
+                                              lambda e: cancelar_confirmacion()),
+                               boton("Eliminar",
+                                     lambda e, c=clave: confirmar_borrado(c),
+                                     ft.Icons.DELETE_OUTLINE, peligro=True),
+                           ]),
+                ]))
 
-        # --- burbuja normal
         acciones = []
         if es_mio:
             acciones = [
-                ft.IconButton(
-                    icon=ft.Icons.EDIT_OUTLINED,
-                    icon_size=15,
-                    icon_color=Tono.TINTA_TENUE,
-                    tooltip="Editar",
-                    on_click=lambda e, c=clave, t=comentario.get("texto", ""):
-                        empezar_edicion(c, t),
-                ),
-                ft.IconButton(
-                    icon=ft.Icons.DELETE_OUTLINE,
-                    icon_size=15,
-                    icon_color=Tono.TINTA_TENUE,
-                    tooltip="Eliminar",
-                    on_click=lambda e, c=clave: pedir_confirmacion(c),
-                ),
+                boton_icono(ft.Icons.EDIT_OUTLINED, "Editar",
+                            lambda e, c=clave, t=comentario.get("texto", ""):
+                            empezar_edicion(c, t)),
+                boton_icono(ft.Icons.DELETE_OUTLINE, "Eliminar",
+                            lambda e, c=clave: pedir_confirmacion(c)),
             ]
 
         return ft.Container(
             padding=ft.Padding.only(left=13, top=11, right=6, bottom=11),
             bgcolor=Tono.ACENTO_FONDO if es_mio else Tono.SUPERFICIE,
-            border=ft.Border.all(1, Tono.BORDE if not es_mio else "#E0E7FF"),
+            border=ft.Border.all(1, Tono.ACENTO_BORDE if es_mio else Tono.BORDE),
             border_radius=ft.BorderRadius.all(12),
-            content=ft.Column(
-                spacing=6,
-                controls=[
-                    ft.Row(
-                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                        controls=[cabecera, ft.Row(spacing=0, controls=acciones)],
-                    ),
-                    ft.Container(
-                        padding=ft.Padding.only(right=8),
-                        content=texto(comentario.get("texto", ""), 13.5,
-                                      selectable=True),
-                    ),
-                ],
-            ),
-        )
+            content=ft.Column(spacing=6, controls=[
+                ft.Row(alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                       controls=[cabecera, ft.Row(spacing=0, controls=acciones)]),
+                ft.Container(padding=ft.Padding.only(right=8),
+                             content=texto(comentario.get("texto", ""), 13.5,
+                                           selectable=True)),
+            ]))
 
     def construir_hilo():
         hilo.controls.clear()
         try:
-            historial = comentarios.listar(id_proyecto, usuario["id_usuario"], id_tarea)
-        except Exception as fallo:
+            historial = comentarios.listar(id_proyecto, usuario["id_usuario"],
+                                           id_tarea)
+        except Exception as fallo:  # noqa: BLE001
             hilo.controls.append(texto(f"No se pudo cargar el hilo: {fallo}", 12,
                                        color=Tono.PELIGRO))
             return
         if not historial:
-            hilo.controls.append(
-                vacio("Nadie ha comentado todavia.\nSea el primero.",
-                      ft.Icons.CHAT_BUBBLE_OUTLINE)
-            )
+            hilo.controls.append(vacio("Nadie ha comentado todavia.",
+                                       ft.Icons.CHAT_BUBBLE_OUTLINE))
         for comentario in historial:
             hilo.controls.append(burbuja(comentario))
 
-    def refrescar_hilo():
-        try:
-            construir_hilo()
-            page.update()
-            medicion.marcar_recepcion(id_proyecto, usuario["id_usuario"])
-        except Exception:
-            pass
-
     def repintar():
+        construir_ficha()
         construir_hilo()
         page.update()
 
-    # --- acciones sobre comentarios
+    def refrescar_desde_evento():
+        try:
+            nueva = cargar_tarea()
+            if nueva is not None:
+                estado_vista["tarea"] = nueva
+            construir_ficha()
+            construir_hilo()
+            page.update()
+            medicion.marcar_recepcion(id_proyecto, usuario["id_usuario"])
+        except Exception:  # noqa: BLE001
+            pass
 
     def empezar_edicion(clave, texto_actual):
         confirmando["clave"] = None
@@ -1347,13 +1788,14 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
         if not contenido:
             avisar(page, "El comentario no puede quedar vacio.", Tono.PELIGRO)
             return
-        medicion.marcar_emision(id_proyecto, usuario["id_usuario"], "comentario_editado")
+        medicion.marcar_emision(id_proyecto, usuario["id_usuario"],
+                                "comentario_editado")
         try:
             comentarios.editar(page, id_proyecto, usuario["id_usuario"], clave,
                                contenido)
         except comentarios.ErrorDeAutoria as fallo:
             avisar(page, str(fallo), Tono.PELIGRO)
-        except Exception as fallo:
+        except Exception as fallo:  # noqa: BLE001
             avisar(page, f"No se pudo editar: {fallo}", Tono.PELIGRO)
             return
         edicion["clave"] = None
@@ -1376,7 +1818,7 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
             comentarios.eliminar(page, id_proyecto, usuario["id_usuario"], clave)
         except comentarios.ErrorDeAutoria as fallo:
             avisar(page, str(fallo), Tono.PELIGRO)
-        except Exception as fallo:
+        except Exception as fallo:  # noqa: BLE001
             avisar(page, f"No se pudo eliminar: {fallo}", Tono.PELIGRO)
             return
         confirmando["clave"] = None
@@ -1386,98 +1828,61 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
         if not nuevo.value or not nuevo.value.strip():
             return
         medicion.marcar_emision(id_proyecto, usuario["id_usuario"], "comentario")
-        try:
-            comentarios.agregar(page, id_proyecto, usuario["id_usuario"],
-                                usuario["nombre"], id_tarea, nuevo.value)
-        except tareas.ErrorDePermiso as fallo:
-            avisar(page, str(fallo), Tono.PELIGRO)
-            return
-        except ValueError as fallo:
-            avisar(page, str(fallo), Tono.PELIGRO)
-            return
-        except Exception as fallo:
-            avisar(page, f"No se pudo publicar: {fallo}", Tono.PELIGRO)
-            return
-        nuevo.value = ""
-        repintar()
+        contenido = nuevo.value
 
+        def trabajo():
+            return comentarios.agregar(page, id_proyecto, usuario["id_usuario"],
+                                       usuario["nombre"], id_tarea, contenido)
+
+        def al_terminar(_, fallo):
+            if fallo:
+                avisar(page, f"No se pudo publicar: {fallo}", Tono.PELIGRO)
+                return
+            nuevo.value = ""
+            construir_hilo()
+
+        ejecutar_fuera_del_hilo(page, estado, boton_publicar, "Publicando...", trabajo,
+                                al_terminar)
+
+    boton_publicar = boton("Publicar", enviar, ft.Icons.SEND_OUTLINED)
+
+    construir_ficha()
     construir_hilo()
 
     # El detalle tambien escucha el tema del proyecto: si un companero comenta
     # la misma tarea mientras esta pantalla esta abierta, el hilo se actualiza.
     soltar_suscripcion(page, estado)
-    tareas.suscribir(page, id_proyecto, lambda mensaje: refrescar_hilo())
+    tareas.suscribir(page, id_proyecto, lambda mensaje: refrescar_desde_evento())
     estado.suscrito_a = id_proyecto
-    estado.refrescar = refrescar_hilo
-
-    estado_actual = (la_tarea or {}).get("estado", "Pendiente")
-    responsable = (la_tarea or {}).get("responsable", "")
-
-    ficha = tarjeta(
-        ft.Column(
-            spacing=10,
-            controls=[
-                ft.Row(
-                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                    vertical_alignment=ft.CrossAxisAlignment.START,
-                    spacing=10,
-                    controls=[
-                        texto((la_tarea or {}).get("titulo", "Tarea"), 17,
-                              ft.FontWeight.W_700, expand=True),
-                        insignia_estado(estado_actual),
-                    ],
-                ),
-                ft.Row(
-                    spacing=8,
-                    wrap=True,
-                    run_spacing=4,
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        circulo(responsable, 10) if responsable else ft.Container(),
-                        texto(responsable or "Sin responsable", 12,
-                              color=Tono.TINTA_SUAVE),
-                        texto((la_tarea or {}).get("fecha_limite", ""), 12,
-                              color=Tono.TINTA_SUAVE),
-                    ],
-                ),
-                ft.Divider(height=1, thickness=1, color=Tono.BORDE_TENUE),
-                texto((la_tarea or {}).get("descripcion", "") or "Sin descripcion.",
-                      13, color=Tono.TINTA_SUAVE, selectable=True),
-            ],
-        )
-    )
+    estado.refrescar = refrescar_desde_evento
 
     return ft.View(
         route=f"/tarea/{id_proyecto}/{id_tarea}",
         bgcolor=Tono.FONDO,
         appbar=barra(page, estado, "Detalle de la tarea", con_volver=True,
-                     ruta_de_regreso=f"/tablero/{id_proyecto}"),
+                     ruta_de_regreso=f"/tablero/{id_proyecto}",
+                     acciones=[
+                         boton_icono(ft.Icons.EDIT_OUTLINED, "Editar la tarea",
+                                     empezar_edicion_tarea),
+                         boton_icono(ft.Icons.DELETE_OUTLINE,
+                                     "Eliminar la tarea", pedir_borrado_tarea),
+                     ]),
         controls=[
-            centrar(
-                [
-                    ficha,
-                    ft.Container(height=2),
-                    rotulo("Conversacion"),
-                    hilo,
-                    ft.Container(height=2),
-                    tarjeta(
-                        ft.Column(
-                            spacing=10,
-                            horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                            controls=[
-                                nuevo,
-                                ft.Row(
-                                    alignment=ft.MainAxisAlignment.END,
-                                    controls=[
-                                        boton("Publicar", enviar, ft.Icons.SEND_OUTLINED)
-                                    ],
-                                ),
-                            ],
-                        ),
-                        relleno=14,
-                    ),
-                ]
-            )
+            centrar(estado, [
+                ficha,
+                ft.Container(height=2),
+                rotulo("Conversacion"),
+                hilo,
+                ft.Container(height=2),
+                tarjeta(ft.Column(
+                    spacing=10,
+                    horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
+                    controls=[
+                        nuevo,
+                        ft.Row(alignment=ft.MainAxisAlignment.END,
+                               controls=[boton_publicar]),
+                    ]), relleno=14),
+            ])
         ],
         padding=ft.Padding.all(0),
         scroll=ft.ScrollMode.AUTO,
@@ -1491,22 +1896,56 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
 
 def main(page: ft.Page):
     estado = Estado()
+    try:
+        estado.bucle = asyncio.get_running_loop()
+    except RuntimeError:
+        estado.bucle = None
 
     page.title = "SyncTask CUN"
     page.bgcolor = Tono.FONDO
-    page.theme = ft.Theme(
-        color_scheme=ft.ColorScheme(
-            primary=Tono.ACENTO,
-            surface=Tono.SUPERFICIE,
-            on_surface=Tono.TINTA,
-        )
-    )
+    page.theme = ft.Theme(color_scheme=ft.ColorScheme(
+        primary=Tono.ACENTO, surface=Tono.SUPERFICIE, on_surface=Tono.TINTA))
     # Se fija el tema claro en lugar de seguir al sistema: en modo oscuro del
     # navegador varios textos quedaban por debajo del contraste exigido por la
     # WCAG 2.1 nivel AA (defecto D-07).
     page.theme_mode = ft.ThemeMode.LIGHT
 
+    def al_cambiar_conexion(e=None):
+        """REQ-10: avisar de la perdida de red y de su recuperacion."""
+        try:
+            tipos = conectividad.get_connectivity()
+            perdida = (not tipos) or all(t == ft.ConnectivityType.NONE
+                                         for t in tipos)
+        except Exception:  # noqa: BLE001
+            return
+        if perdida == estado.sin_conexion:
+            return
+        estado.sin_conexion = perdida
+        if estado.banda is not None:
+            estado.banda.visible = perdida
+        if not perdida:
+            avisar(page, "Conexion restablecida.", Tono.EXITO)
+            # Al volver la red, lo que se ve puede estar desactualizado: se
+            # vuelve a leer en lugar de esperar al proximo evento ajeno.
+            if estado.refrescar:
+                estado.refrescar()
+        try:
+            page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
+    preferencias = ft.SharedPreferences()
+    portapapeles = ft.Clipboard()
+    conectividad = ft.Connectivity(on_change=al_cambiar_conexion)
+    servicios = [preferencias, portapapeles, conectividad]
+    estado.preferencias = preferencias
+    estado.portapapeles = portapapeles
+
     def mostrar(vista):
+        # Los servicios se enganchan a cada vista porque el enrutador sustituye
+        # la vista raiz en cada navegacion; son siempre los mismos objetos, de
+        # modo que lo guardado en el dispositivo sobrevive al cambio.
+        vista.services = servicios
         page.views = [vista]
         page.update()
 
@@ -1524,9 +1963,7 @@ def main(page: ft.Page):
 
         # Ninguna pantalla distinta del ingreso y el registro se construye sin
         # usuario autenticado: una direccion escrita a mano no debe conceder
-        # acceso (REQ-07, REQ-11). Se navega en lugar de pintar el ingreso en
-        # el sitio para que la direccion del navegador no siga anunciando una
-        # pantalla que no se esta mostrando.
+        # acceso (REQ-07, REQ-11).
         if not estado.usuario and ruta not in ("/", "/registro"):
             soltar_suscripcion(page, estado)
             page.navigate("/")
@@ -1567,9 +2004,6 @@ def main(page: ft.Page):
         page.navigate(destino)
 
     def al_desconectar(e):
-        # REQ-10: el cliente web de Flet reintenta la conexion por su cuenta.
-        # Lo unico que corresponde aqui es soltar la suscripcion para no
-        # acumular manejadores de una sesion que ya no esta.
         soltar_suscripcion(page, estado)
 
     page.on_route_change = al_cambiar_de_ruta
@@ -1581,6 +2015,23 @@ def main(page: ft.Page):
     # esta no genera ningun evento.
     al_cambiar_de_ruta()
 
+    # Sesion recordada. Va despues del primer pintado porque consultar el
+    # almacenamiento del dispositivo exige que los servicios esten montados, y
+    # solo lo estan una vez que la vista existe. Si hay sesion valida se
+    # reencamina; si no, el usuario ya esta viendo la pantalla de ingreso.
+    if not estado.usuario:
+        try:
+            recordado = recordar.recuperar(preferencias)
+        except Exception:  # noqa: BLE001
+            recordado = None
+        if recordado:
+            estado.usuario = recordado
+            destino = page.route or "/"
+            if destino in ("/", "/registro"):
+                page.navigate("/proyectos")
+            else:
+                al_cambiar_de_ruta()
+
 
 if __name__ == "__main__":
     ft.run(
@@ -1589,4 +2040,5 @@ if __name__ == "__main__":
         port=8550,
         view=ft.AppView.WEB_BROWSER,
         route_url_strategy=ft.RouteUrlStrategy.HASH,
+        assets_dir="assets",
     )

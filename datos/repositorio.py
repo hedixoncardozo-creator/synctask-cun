@@ -397,3 +397,170 @@ def eliminar_comentario(id_proyecto, clave_orden, id_autor):
             ) from error
         raise
     return respuesta["Attributes"]
+
+
+from datetime import timedelta  # noqa: E402  (va con el resto de imports)
+
+# --------------------------------------------- edicion y supresion de tareas
+
+# Las tareas se suprimen igual que los comentarios: con una marca, no con
+# delete_item. La razon es distinta, eso si. En un comentario lo que se protege
+# es la constancia del aporte individual; en una tarea, lo que se protege es la
+# conversacion que cuelga de ella. Un delete_item dejaria los comentarios de esa
+# tarea convertidos en elementos huerfanos: seguirian ocupando la particion del
+# proyecto, los contaria contar_por_tarea, y nadie podria llegar a ellos para
+# entender de que hablaban. Marcar la tarea mantiene el arbol entero coherente
+# con una sola escritura.
+
+
+def editar_tarea(id_proyecto, id_tarea, titulo, descripcion, responsable,
+                 fecha_limite):
+    """Actualiza los campos editables de una tarea vigente (REQ-03).
+
+    No admite cambiar el estado: para eso esta cambiar_estado(), que ademas
+    difunde el evento correspondiente. Mezclar ambas cosas en una sola funcion
+    haria que un error de escritura en el titulo moviera la tarea de columna.
+    """
+    if not titulo or not titulo.strip():
+        raise ValueError("La tarea necesita un titulo.")
+
+    tabla = obtener_tabla()
+    try:
+        respuesta = tabla.update_item(
+            Key={"PK": f"PROYECTO#{id_proyecto}", "SK": f"TAREA#{id_tarea}"},
+            UpdateExpression=(
+                "SET titulo = :titulo, descripcion = :desc, "
+                "responsable = :resp, fecha_limite = :fecha, "
+                "fecha_edicion = :ahora"
+            ),
+            ConditionExpression=(
+                "attribute_exists(PK) AND attribute_not_exists(eliminada)"
+            ),
+            ExpressionAttributeValues={
+                ":titulo": titulo.strip(),
+                ":desc": (descripcion or "").strip(),
+                ":resp": (responsable or "").strip(),
+                ":fecha": (fecha_limite or "").strip(),
+                ":ahora": _ahora(),
+            },
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ValueError("Esa tarea ya no existe o fue eliminada.") from error
+        raise
+    return respuesta["Attributes"]
+
+
+def eliminar_tarea(id_proyecto, id_tarea):
+    """Marca una tarea como eliminada, conservando su hilo de comentarios."""
+    tabla = obtener_tabla()
+    try:
+        respuesta = tabla.update_item(
+            Key={"PK": f"PROYECTO#{id_proyecto}", "SK": f"TAREA#{id_tarea}"},
+            UpdateExpression="SET eliminada = :si, fecha_eliminacion = :ahora",
+            ConditionExpression=(
+                "attribute_exists(PK) AND attribute_not_exists(eliminada)"
+            ),
+            ExpressionAttributeValues={":si": True, ":ahora": _ahora()},
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ValueError("Esa tarea ya fue eliminada.") from error
+        raise
+    return respuesta["Attributes"]
+
+
+# ------------------------------------------------------- sesiones recordadas
+
+# El objetivo es que al abrir el APK no haya que escribir correo y contrasena
+# cada vez. La tentacion facil seria guardar en el telefono el identificador
+# del usuario y confiar en el al arrancar; eso seria un agujero evidente, ya
+# que cualquiera que editara ese valor pasaria a ser otra persona.
+#
+# En su lugar se emite un testigo: una cadena aleatoria de 256 bits que no
+# significa nada por si misma, se guarda en el telefono, y cuya correspondencia
+# con un usuario vive solo en DynamoDB. Adivinarlo no es viable y falsificarlo
+# tampoco, porque no se deriva de ningun dato del usuario. Caduca a los treinta
+# dias y se revoca al cerrar sesion.
+#
+# Queda declarado un limite: el testigo se guarda sin cifrar en el
+# almacenamiento de la aplicacion. En Android ese almacenamiento es privado de
+# la aplicacion, pero un telefono con acceso de superusuario podria leerlo. La
+# mitigacion real seria el almacen de credenciales del sistema, que excede el
+# alcance de esta entrega.
+
+DIAS_DE_VIGENCIA = 30
+
+
+def crear_testigo(id_usuario):
+    """Emite un testigo de sesion y devuelve su cadena."""
+    testigo = secrets.token_urlsafe(32)
+    momento = datetime.now(timezone.utc)
+    caduca = momento + timedelta(days=DIAS_DE_VIGENCIA)
+
+    obtener_tabla().put_item(
+        Item={
+            "PK": f"TESTIGO#{testigo}",
+            "SK": "SESION",
+            "id_usuario": id_usuario,
+            "fecha_emision": momento.isoformat(),
+            "fecha_caducidad": caduca.isoformat(),
+            # Segundos desde la epoca, para poder activar mas adelante la
+            # expiracion automatica de DynamoDB sobre este atributo y que la
+            # tabla se limpie sola sin un proceso de mantenimiento.
+            "caduca_epoch": int(caduca.timestamp()),
+        }
+    )
+    return testigo
+
+
+def usuario_de_testigo(testigo):
+    """Devuelve el identificador de usuario del testigo, o None.
+
+    Comprueba la caducidad en el momento de usar el testigo y no confia en que
+    la expiracion automatica de la tabla ya lo haya retirado: esa expiracion no
+    garantiza un instante exacto de borrado.
+    """
+    if not testigo:
+        return None
+    respuesta = obtener_tabla().get_item(Key={"PK": f"TESTIGO#{testigo}",
+                                              "SK": "SESION"})
+    elemento = respuesta.get("Item")
+    if not elemento:
+        return None
+    try:
+        caduca = datetime.fromisoformat(elemento["fecha_caducidad"])
+    except (KeyError, ValueError):
+        return None
+    if caduca <= datetime.now(timezone.utc):
+        return None
+    return elemento.get("id_usuario")
+
+
+def revocar_testigo(testigo):
+    """Invalida un testigo. Se invoca al cerrar sesion."""
+    if not testigo:
+        return
+    obtener_tabla().delete_item(Key={"PK": f"TESTIGO#{testigo}", "SK": "SESION"})
+
+
+def obtener_usuario(id_usuario):
+    """Perfil publico de un usuario a partir de su identificador.
+
+    Devuelve None si no existe. Nunca incluye la clave derivada ni la sal: se
+    limpian aqui para que ningun camino de la aplicacion pueda llevarlas a la
+    pantalla por descuido.
+    """
+    respuesta = obtener_tabla().get_item(
+        Key={"PK": f"USUARIO#{id_usuario}", "SK": "PERFIL"}
+    )
+    elemento = respuesta.get("Item")
+    if not elemento:
+        return None
+    return {
+        "id_usuario": id_usuario,
+        "nombre": elemento.get("nombre", ""),
+        "correo": elemento.get("correo", ""),
+    }

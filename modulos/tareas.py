@@ -167,3 +167,63 @@ def cancelar_suscripcion(page, id_proyecto):
     page.pubsub.unsubscribe_topic(tema_de(id_proyecto))
 
 
+
+
+TAREA_EDITADA = "tarea_editada"
+TAREA_ELIMINADA = "tarea_eliminada"
+
+
+def editar(page, id_proyecto, id_usuario, id_tarea, titulo, descripcion,
+           responsable, fecha_limite):
+    """Corrige los datos de una tarea y avisa a las demas sesiones (REQ-03).
+
+    Puede editarla cualquier integrante del proyecto, no solo quien la creo.
+    Una tarea es un acuerdo del equipo, no una propiedad personal: si alguien
+    escribe mal una fecha y se ausenta, el resto debe poder arreglarla. Es la
+    diferencia con un comentario, que si es de quien lo escribio y por eso
+    exige autoria.
+    """
+    _exigir_pertenencia(id_proyecto, id_usuario)
+
+    tarea = repositorio.editar_tarea(
+        id_proyecto=id_proyecto,
+        id_tarea=id_tarea,
+        titulo=titulo,
+        descripcion=descripcion,
+        responsable=responsable,
+        fecha_limite=fecha_limite,
+    )
+
+    _difundir(page, id_proyecto, {
+        "evento": TAREA_EDITADA,
+        "tarea": tarea,
+        "autor": id_usuario,
+    })
+    return tarea
+
+
+def eliminar(page, id_proyecto, id_usuario, id_tarea):
+    """Retira una tarea del tablero conservando su hilo de comentarios."""
+    _exigir_pertenencia(id_proyecto, id_usuario)
+
+    tarea = repositorio.eliminar_tarea(id_proyecto=id_proyecto,
+                                       id_tarea=id_tarea)
+
+    _difundir(page, id_proyecto, {
+        "evento": TAREA_ELIMINADA,
+        "tarea": tarea,
+        "autor": id_usuario,
+    })
+    return tarea
+
+
+def vigentes(lista_de_tareas):
+    """Descarta las tareas marcadas como eliminadas.
+
+    El filtro vive aqui y no en la consulta porque DynamoDB cobra la lectura
+    de los elementos antes de aplicar un FilterExpression: filtrar en la base
+    de datos costaria lo mismo y anadiria complejidad a la clave. A la escala
+    de un proyecto de curso la diferencia es nula, y asi la consulta sigue
+    siendo la misma para todos los casos.
+    """
+    return [t for t in lista_de_tareas if not t.get("eliminada")]
