@@ -50,8 +50,8 @@ from datetime import date, datetime, timezone
 
 import flet as ft
 
-from modulos import (comentarios, medicion, proyectos, recordar, sesion,
-                     tareas)
+from modulos import (avisos, comentarios, medicion, notificaciones,
+                     proyectos, recordar, sesion, tareas)
 
 # ===========================================================================
 # Sistema visual
@@ -122,6 +122,8 @@ class Estado:
         self.refrescar = None
         self.sin_conexion = False
         self.banda = None
+        self.vibracion = None
+        self.notificador = None
         self.preferencias = None
         self.portapapeles = None
         # Bucle de eventos de esta sesion. Se captura en main(), que si corre
@@ -240,6 +242,24 @@ def fecha_valida(texto_fecha):
         return False
 
 
+def vibrar(estado, intenso=False):
+    """Golpecito en el telefono al llegar un cambio ajeno.
+
+    En un navegador de escritorio no hace nada. Es lo mas parecido a una
+    notificacion que se puede dar sin salir de la aplicacion, y llega incluso
+    cuando el usuario no esta mirando la pantalla.
+    """
+    try:
+        if estado.vibracion is None:
+            return
+        if intenso:
+            estado.vibracion.medium_impact()
+        else:
+            estado.vibracion.light_impact()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def avisar(page, mensaje, color=None):
     page.show_dialog(
         ft.SnackBar(
@@ -305,11 +325,18 @@ def ejecutar_fuera_del_hilo(page, estado, control, etiqueta_espera, trabajo,
 
 
 def banda_de_conexion(estado):
-    """Franja que avisa de la perdida de conexion (REQ-10).
+    """Franja de estado de la conexion (REQ-10).
 
-    Es una franja persistente y no un mensaje efimero porque la condicion que
-    comunica dura: mientras no haya red, el usuario necesita seguir viendola
-    para entender por que sus cambios no llegan a nadie.
+    Advertencia sobre su alcance, comprobada con un navegador real al que se
+    le corto la red: esta franja la dibuja el servidor, de modo que solo puede
+    aparecer si hay conexion para enviarla. Durante un corte real no se vera.
+    Queda porque si cubre el caso en que el dispositivo informa que se quedo
+    sin red mientras la conexion con el servidor aun no ha muerto —cambio a
+    modo avion con la aplicacion abierta, tipicamente—, pero el mecanismo que
+    de verdad sostiene el REQ-10 es la recuperacion: cuando la conexion vuelve,
+    page.on_connect si llega al servidor y entonces se relee el tablero y se
+    avisa. La deteccion durante el corte la hace el cliente de Flet por su
+    cuenta, con su propio reintento y su propio aviso.
     """
     return ft.Container(
         visible=estado.sin_conexion,
@@ -1216,15 +1243,38 @@ def vista_tablero(page, estado, id_proyecto):
         estado.filtro = etiqueta
         pintar()
 
-    def refrescar_desde_evento():
-        """Lo invoca el manejador de PubSub, en otro hilo."""
+    def refrescar_desde_evento(propio=False):
+        """Lo invoca el manejador de PubSub, en otro hilo.
+
+        `propio` lo ponen las acciones de esta misma sesion: a nadie hay que
+        avisarle de lo que acaba de hacer. Sin esa distincion, cada vez que
+        uno crea una tarea se avisa a si mismo, que es el defecto mas comun
+        de este tipo de avisos.
+        """
         try:
+            # Foto del tablero antes de releer, para poder contar que cambio.
+            antes = list(datos["tareas"])
+            conteo_antes = dict(conteo)
+
             recargar()
             pintar()
             # La medicion se toma aqui y no antes: el requisito habla de
             # cuando el companero *ve* el cambio, de modo que el cronometro
             # para cuando la pantalla ya esta reconstruida (REQ-12).
             medicion.marcar_recepcion(id_proyecto, usuario["id_usuario"])
+
+            if propio:
+                return
+            frases = avisos.describir(antes, datos["tareas"], conteo_antes,
+                                      conteo)
+            if not frases:
+                return
+            avisar(page, avisos.resumir(frases), Tono.ACENTO)
+            vibrar(estado)
+            titulo_aviso, cuerpo = avisos.titulo_y_cuerpo(frases,
+                                                          nombre_proyecto)
+            notificaciones.mostrar(estado.bucle, estado.notificador,
+                                   titulo_aviso, cuerpo)
         except Exception:  # noqa: BLE001
             # Una sesion que ya navego a otra pantalla no debe tumbar el
             # proceso por intentar actualizar controles ausentes.
@@ -1244,7 +1294,7 @@ def vista_tablero(page, estado, id_proyecto):
         except Exception as fallo:  # noqa: BLE001
             avisar(page, f"No se pudo mover la tarea: {fallo}", Tono.PELIGRO)
             return
-        refrescar_desde_evento()
+        refrescar_desde_evento(propio=True)
 
     def alternar_formulario(e):
         formulario.visible = not formulario.visible
@@ -1300,7 +1350,7 @@ def vista_tablero(page, estado, id_proyecto):
             fecha_tarea.value = ""
             formulario.visible = False
             avisar(page, "Tarea creada.", Tono.EXITO)
-            refrescar_desde_evento()
+            refrescar_desde_evento(propio=True)
 
         ejecutar_fuera_del_hilo(page, estado, boton_guardar, "Guardando...", trabajo,
                                 al_terminar)
@@ -1761,7 +1811,14 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
         page.update()
 
     def refrescar_desde_evento():
+        """Refresca el detalle y avisa si el cambio vino de otra persona."""
         try:
+            try:
+                antes = len(comentarios.listar(id_proyecto,
+                                               usuario["id_usuario"], id_tarea))
+            except Exception:  # noqa: BLE001
+                antes = None
+
             nueva = cargar_tarea()
             if nueva is not None:
                 estado_vista["tarea"] = nueva
@@ -1769,6 +1826,19 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
             construir_hilo()
             page.update()
             medicion.marcar_recepcion(id_proyecto, usuario["id_usuario"])
+
+            if antes is None:
+                return
+            ahora = len(comentarios.listar(id_proyecto, usuario["id_usuario"],
+                                           id_tarea))
+            if ahora > antes:
+                titulo_tarea_actual = (estado_vista["tarea"] or {}).get(
+                    "titulo", "la tarea")
+                frase = f"Nuevo comentario en «{titulo_tarea_actual}»"
+                avisar(page, frase, Tono.ACENTO)
+                vibrar(estado)
+                notificaciones.mostrar(estado.bucle, estado.notificador,
+                                       "SyncTask CUN", frase)
         except Exception:  # noqa: BLE001
             pass
 
@@ -1937,9 +2007,36 @@ def main(page: ft.Page):
     preferencias = ft.SharedPreferences()
     portapapeles = ft.Clipboard()
     conectividad = ft.Connectivity(on_change=al_cambiar_conexion)
-    servicios = [preferencias, portapapeles, conectividad]
+    vibracion = ft.HapticFeedback()
+    # El servicio de notificaciones solo se engancha cuando quien se conecta es
+    # la aplicacion instalada en un telefono, nunca un navegador.
+    #
+    # El motivo es que una extension de Flet tiene dos mitades: la de Python,
+    # que corre aqui, y la de Dart, que va compilada dentro del cliente. El APK
+    # la lleva porque se declara en apk/pyproject.toml. El cliente web es un
+    # paquete ya construido que no la lleva ni puede llevarla, asi que
+    # declararle un servicio que no sabe crear es pedirle algo imposible.
+    #
+    # La condicion esta escrita para fallar hacia el lado seguro: si no se
+    # puede confirmar que el cliente es nativo, no se engancha nada. Se pierde
+    # la notificacion del sistema —una comodidad— pero el aviso dentro de la
+    # pantalla sigue saliendo igual, y eso es lo que no puede fallar.
+    en_telefono = (not page.web) and page.platform in (
+        ft.PagePlatform.ANDROID,
+        ft.PagePlatform.ANDROID_TV,
+        ft.PagePlatform.IOS,
+    )
+    notificador = notificaciones.crear_servicio() if en_telefono else None
+
+    servicios = [preferencias, portapapeles, conectividad, vibracion]
+    if notificador is not None:
+        servicios.append(notificador)
+
     estado.preferencias = preferencias
     estado.portapapeles = portapapeles
+    estado.vibracion = vibracion
+    estado.notificador = notificador
+    notificaciones.preparar(estado.bucle, notificador)
 
     def mostrar(vista):
         # Los servicios se enganchan a cada vista porque el enrutador sustituye
@@ -2004,11 +2101,40 @@ def main(page: ft.Page):
         page.navigate(destino)
 
     def al_desconectar(e):
+        """El servidor se entera de que el cliente se fue (REQ-10).
+
+        Lo unico util que se puede hacer aqui es soltar la suscripcion: no hay
+        por donde avisar a una pantalla que ya no esta escuchando.
+        """
+        estado.sin_conexion = True
         soltar_suscripcion(page, estado)
+
+    def al_reconectar(e):
+        """La conexion volvio (REQ-10).
+
+        Este es el mecanismo que de verdad sostiene el requisito. Mientras no
+        hay red, el servidor no puede pintar nada; cuando vuelve, este evento
+        si llega, y entonces hay dos cosas que hacer: avisar al usuario de que
+        ya esta en linea, y releer el tablero, porque lo que tiene en pantalla
+        puede llevar minutos desactualizado y esperar al proximo cambio ajeno
+        lo dejaria mintiendo.
+        """
+        if not estado.sin_conexion:
+            return
+        estado.sin_conexion = False
+        if estado.banda is not None:
+            estado.banda.visible = False
+        try:
+            avisar(page, "Conexion restablecida. El tablero esta al dia.",
+                   Tono.EXITO)
+            al_cambiar_de_ruta()
+        except Exception:  # noqa: BLE001
+            pass
 
     page.on_route_change = al_cambiar_de_ruta
     page.on_view_pop = al_volver
     page.on_disconnect = al_desconectar
+    page.on_connect = al_reconectar
 
     # Primer pintado. No se navega: la ruta ya es la correcta —sea "/" o un
     # enlace directo a un tablero— y pedirle al navegador que vaya adonde ya

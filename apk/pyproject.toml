@@ -1,0 +1,61 @@
+# Configuracion de compilacion del APK de SyncTask CUN (REQ-13).
+#
+# `flet build apk` lee este archivo. Tener los valores aqui en lugar de en la
+# linea de comandos tiene dos ventajas: queda versionado en el repositorio, y
+# cualquiera del equipo compila exactamente el mismo APK sin memorizar banderas.
+
+[project]
+name = "synctask"
+version = "1.0.0"
+description = "Tareas colaborativas con sincronizacion en tiempo real"
+requires-python = ">=3.12"
+
+# Estas son TODAS las dependencias del telefono. No aparece boto3 por ningun
+# lado, y eso es deliberado: la cascara no habla con AWS, asi que en el APK no
+# hay ni una linea de codigo de acceso a la base de datos.
+#
+# `flet-notifications` es la que trae el lado Dart de las notificaciones. Debe
+# estar declarada aqui para que `flet build` la compile dentro del APK, y
+# tambien instalada en el servidor (pip install en el venv), que es quien pide
+# que se muestre el aviso. Si solo esta en uno de los dos lados, las
+# notificaciones del sistema no salen.
+dependencies = [
+    "flet==0.86.5",
+    "flet-notifications==0.1.4",
+]
+
+[tool.flet]
+product = "SyncTask CUN"
+company = "Corporacion Unificada Nacional de Educacion Superior"
+copyright = "2026 Hedixon Cardozo, Luis Manchego - Programacion para Dispositivos Moviles"
+
+# Identificador del paquete en Android. Es permanente: si se cambia despues de
+# instalar, Android lo trata como otra aplicacion distinta y quedan las dos.
+bundle_id = "co.edu.cun.synctask"
+
+[tool.flet.splash]
+# Fondo de la pantalla de presentacion, detras de assets/splash_android.png.
+# Es el indigo de la marca, el mismo con el que se genero el degradado del
+# icono, para que no se note el corte entre el fondo y la imagen.
+color = "#4F46E5"
+dark_color = "#4338CA"
+
+[tool.flet.android]
+# Android recorta el icono adaptativo con la forma que tenga configurado el
+# telefono (circulo, cuadrado redondeado, gota). Por eso icon_android.png
+# dibuja la marca al 60% del lienzo: asi ningun recorte se la come. Este color
+# es la capa de fondo que queda visible alrededor.
+adaptive_icon_background = "#4F46E5"
+
+[tool.flet.android.permission]
+# Obligatorio desde Android 13 para poder publicar en la bandeja. La propia
+# aplicacion lo pide al abrirse (modulos/notificaciones.py), pero si no se
+# declara aqui el sistema ni siquiera muestra el dialogo.
+"android.permission.POST_NOTIFICATIONS" = true
+
+# Para el retorno tactil al mover una tarea (ft.HapticFeedback).
+"android.permission.VIBRATE" = true
+
+# La aplicacion no sirve sin red. Flutter la agrega por su cuenta, pero se
+# deja explicita para que el manifiesto se lea solo.
+"android.permission.INTERNET" = true
