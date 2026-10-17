@@ -27,9 +27,6 @@ def _generar_codigo():
     alfabeto = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alfabeto) for _ in range(6))
 
-
-# ---------------------------------------------------------------- proyectos
-
 def crear_proyecto(nombre, descripcion, id_administrador, nombre_administrador):
     """Crea un proyecto, su espejo de codigo y vincula al administrador (REQ-01).
 
@@ -180,7 +177,7 @@ def listar_integrantes(id_proyecto):
     return respuesta["Items"]
 
 
-# ------------------------------------------------------------------- tareas
+# tareas
 
 def crear_tarea(id_proyecto, titulo, descripcion, responsable, fecha_limite):
     """Crea una tarea en estado Pendiente (REQ-03)."""
@@ -236,18 +233,6 @@ def listar_tareas(id_proyecto):
 
 # -------------------------------------------------------------- comentarios
 
-# Los comentarios usan el prefijo COMENTARIO# en lugar de anidarse bajo TAREA#,
-# como preveia el modelo de la Entrega 1. Anidarlos hacia que la consulta de
-# tareas (begins_with "TAREA#") devolviera tambien los comentarios mezclados
-# con las tarjetas del tablero. Con un prefijo propio, cada patron de acceso se
-# resuelve con una consulta exacta y sin lecturas desperdiciadas.
-#
-# La clave de ordenamiento incluye un sufijo aleatorio corto ademas de la marca
-# de tiempo. La marca sola admitiria que dos comentarios escritos en el mismo
-# microsegundo compartieran clave, y el segundo sobrescribiria al primero sin
-# aviso. El sufijo elimina esa posibilidad y no altera el orden cronologico,
-# porque la marca de tiempo domina la comparacion lexicografica.
-
 
 def agregar_comentario(id_proyecto, id_tarea, id_autor, nombre_autor, texto):
     """Agrega un comentario de texto plano a una tarea (REQ-06).
@@ -302,31 +287,6 @@ def listar_comentarios_del_proyecto(id_proyecto):
     return respuesta["Items"]
 
 
-# ============================================================================
-# PEGAR ESTE BLOQUE AL FINAL DE datos/repositorio.py
-# ============================================================================
-
-# ------------------------------------------- indice de proyectos por usuario
-
-# La tabla no tiene indices secundarios, de modo que no existe forma de
-# preguntar "a que proyectos pertenece este usuario" sin recorrerla entera.
-# Un recorrido completo es inaceptable: su costo crece con el tamano de la
-# tabla, no con el numero de proyectos del usuario.
-#
-# La solucion del diseno de tabla unica es escribir un elemento espejo bajo la
-# clave de particion del usuario. Como el perfil ya vive en USUARIO#{id} con
-# SK PERFIL, anadir SK PROYECTO#{idProyecto} deja ambos patrones de acceso en
-# la misma particion y los resuelve con una sola consulta.
-#
-# El registro autoritativo de la pertenencia sigue siendo el elemento
-# MIEMBRO#{idUsuario} bajo el proyecto, que es el que consulta es_miembro() y
-# por lo tanto el que gobierna el control de acceso (REQ-07). Este espejo es
-# solo un indice de lectura. Si su escritura fallara, el usuario conservaria
-# el acceso al proyecto y bastaria volver a introducir el codigo para
-# reconstruirlo, porque put_item sobreescribe sin error. Es decir: el fallo
-# degrada la comodidad, nunca la correccion ni los permisos.
-
-
 def registrar_proyecto_de_usuario(id_usuario, id_proyecto, nombre_proyecto, rol):
     """Anade el proyecto al indice de lectura del usuario.
 
@@ -367,3 +327,73 @@ def obtener_proyecto(id_proyecto):
         Key={"PK": f"PROYECTO#{id_proyecto}", "SK": "METADATOS"}
     )
     return respuesta.get("Item")
+
+
+class ErrorDeAutoria(Exception):
+    """Se intento modificar un comentario ajeno, o ya suprimido."""
+
+
+def editar_comentario(id_proyecto, clave_orden, id_autor, texto):
+    """Reemplaza el texto de un comentario propio (REQ-06).
+
+    Deja constancia de la edicion con fecha_edicion: un comentario editado no
+    debe poder hacerse pasar por el original.
+    """
+    if not texto or not texto.strip():
+        raise ValueError("El comentario no puede quedar vacio.")
+
+    tabla = obtener_tabla()
+    try:
+        respuesta = tabla.update_item(
+            Key={"PK": f"PROYECTO#{id_proyecto}", "SK": clave_orden},
+            UpdateExpression="SET texto = :texto, fecha_edicion = :ahora",
+            ConditionExpression=(
+                "id_autor = :autor AND attribute_not_exists(eliminado)"
+            ),
+            ExpressionAttributeValues={
+                ":texto": texto.strip(),
+                ":ahora": _ahora(),
+                ":autor": id_autor,
+            },
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ErrorDeAutoria(
+                "Solo el autor puede editar su comentario, y no si ya fue eliminado."
+            ) from error
+        raise
+    return respuesta["Attributes"]
+
+
+def eliminar_comentario(id_proyecto, clave_orden, id_autor):
+    """Marca como eliminado un comentario propio, conservando la huella.
+
+    No se usa delete_item: el elemento sobrevive sin texto, de modo que el
+    hilo conserva su forma y queda registro de que hubo una participacion.
+    """
+    tabla = obtener_tabla()
+    try:
+        respuesta = tabla.update_item(
+            Key={"PK": f"PROYECTO#{id_proyecto}", "SK": clave_orden},
+            UpdateExpression=(
+                "SET eliminado = :si, texto = :vacio, fecha_eliminacion = :ahora"
+            ),
+            ConditionExpression=(
+                "id_autor = :autor AND attribute_not_exists(eliminado)"
+            ),
+            ExpressionAttributeValues={
+                ":si": True,
+                ":vacio": "",
+                ":ahora": _ahora(),
+                ":autor": id_autor,
+            },
+            ReturnValues="ALL_NEW",
+        )
+    except ClientError as error:
+        if error.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            raise ErrorDeAutoria(
+                "Solo el autor puede eliminar su comentario, y solo una vez."
+            ) from error
+        raise
+    return respuesta["Attributes"]
