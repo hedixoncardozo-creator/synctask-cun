@@ -35,7 +35,7 @@ leerlo:
 
 import flet as ft
 
-from modulos import comentarios, proyectos, sesion, tareas
+from modulos import comentarios, medicion, proyectos, sesion, tareas
 
 # --------------------------------------------------------------- presentacion
 
@@ -728,12 +728,17 @@ def vista_tablero(page, estado, id_proyecto):
         try:
             recargar()
             pintar()
+            # La medicion se toma aqui y no antes: el requisito habla de
+            # cuando el companero *ve* el cambio, de modo que el cronometro
+            # para cuando la pantalla ya esta reconstruida (REQ-12).
+            medicion.marcar_recepcion(id_proyecto, usuario["id_usuario"])
         except Exception:
             # Una sesion que ya navego a otra pantalla no debe tumbar el
             # proceso por intentar actualizar controles ausentes.
             pass
 
     def mover(id_tarea, destino):
+        medicion.marcar_emision(id_proyecto, usuario["id_usuario"], "cambio_de_estado")
         try:
             tareas.cambiar_estado(
                 page, id_proyecto, usuario["id_usuario"], id_tarea, destino
@@ -756,6 +761,7 @@ def vista_tablero(page, estado, id_proyecto):
         if not titulo_tarea.value or not titulo_tarea.value.strip():
             avisar(page, "La tarea necesita un titulo.", ft.Colors.RED_700)
             return
+        medicion.marcar_emision(id_proyecto, usuario["id_usuario"], "tarea_creada")
         try:
             tareas.crear(
                 page,
@@ -1015,12 +1021,14 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
         try:
             construir_hilo()
             page.update()
+            medicion.marcar_recepcion(id_proyecto, usuario["id_usuario"])
         except Exception:
             pass
 
     def enviar(e):
         if not texto.value or not texto.value.strip():
             return
+        medicion.marcar_emision(id_proyecto, usuario["id_usuario"], "comentario")
         try:
             comentarios.agregar(
                 page,
