@@ -592,7 +592,11 @@ def cerrar_sesion(page, estado):
     """
     soltar_suscripcion(page, estado)
     try:
-        recordar.olvidar(estado.preferencias)
+        # No se espera a que termine: borrar el testigo y revocarlo en la
+        # tabla ocurre en segundo plano. Hacer esperar a alguien que acaba de
+        # pulsar "cerrar sesion" seria absurdo, y la pantalla a la que va no
+        # depende de ese resultado.
+        recordar.olvidar(estado.bucle, estado.preferencias)
     except Exception:  # noqa: BLE001
         pass
     estado.usuario = None
@@ -638,7 +642,8 @@ def vista_ingreso(page, estado):
         def trabajo():
             usuario = sesion.autenticar(*datos)
             if usuario:
-                recordar.recordar(estado.preferencias, usuario["id_usuario"])
+                recordar.recordar(estado.bucle, estado.preferencias,
+                                  usuario["id_usuario"])
             return usuario
 
         def al_terminar(usuario, fallo):
@@ -769,7 +774,8 @@ def vista_registro(page, estado):
 
         def trabajo():
             usuario = sesion.registrar_usuario(datos[0], datos[1], datos[2], True)
-            recordar.recordar(estado.preferencias, usuario["id_usuario"])
+            recordar.recordar(estado.bucle, estado.preferencias,
+                              usuario["id_usuario"])
             return usuario
 
         def al_terminar(usuario, fallo):
@@ -2145,18 +2151,30 @@ def main(page: ft.Page):
     # almacenamiento del dispositivo exige que los servicios esten montados, y
     # solo lo estan una vez que la vista existe. Si hay sesion valida se
     # reencamina; si no, el usuario ya esta viendo la pantalla de ingreso.
+    #
+    # El resultado llega por devolucion de llamada y no como valor devuelto:
+    # leer el dispositivo es asincrono, y aqui estamos dentro del bucle de
+    # eventos, donde esperar un resultado congelaria la aplicacion de todos
+    # los usuarios conectados. Ver la explicacion en modulos/recordar.py.
     if not estado.usuario:
-        try:
-            recordado = recordar.recuperar(preferencias)
-        except Exception:  # noqa: BLE001
-            recordado = None
-        if recordado:
+        def al_recuperar(recordado):
+            if not recordado:
+                return
+            # Si mientras se resolvia el testigo la persona ya ingreso a mano,
+            # no se la mueve de donde esta.
+            if estado.usuario:
+                return
             estado.usuario = recordado
             destino = page.route or "/"
             if destino in ("/", "/registro"):
                 page.navigate("/proyectos")
             else:
                 al_cambiar_de_ruta()
+
+        try:
+            recordar.recuperar(estado.bucle, preferencias, al_recuperar)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":

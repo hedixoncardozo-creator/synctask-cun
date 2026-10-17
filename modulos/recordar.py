@@ -17,6 +17,28 @@ dispositivo, de modo que bastaria sustituirlo por el de otra persona para
 entrar como ella. Un testigo aleatorio no se puede deducir del identificador
 de nadie, y su correspondencia vive solo en la base de datos.
 
+Por que estas funciones no devuelven el valor y ya
+---------------------------------------------------
+La primera version de este modulo llamaba a `preferencias.get(...)` y usaba el
+resultado como si fuera el testigo. No lo es: en Flet 0.86 las tres
+operaciones de `SharedPreferences` —`get`, `set` y `remove`— son asincronas y
+no existe variante sincrona. Llamadas sin `await` devuelven una corrutina que
+nadie ejecuta, de modo que no se guardaba nada y, al recuperar, se consultaba
+DynamoDB con la clave `TESTIGO#<coroutine object ...>`. La funcion quedaba
+muerta en silencio porque todo estaba envuelto en `try/except`; el unico
+rastro eran tres `RuntimeWarning: coroutine ... was never awaited` en el
+registro del servicio.
+
+De ahi la forma de este modulo. Toda operacion sobre el dispositivo se
+programa en el bucle de eventos, y el resultado se entrega por devolucion de
+llamada en lugar de devolverse. Quien llama corre dentro de ese mismo bucle y
+no puede esperar un resultado sin bloquearlo entero —y este servidor atiende a
+todos los usuarios con un solo bucle, asi que bloquearlo congela la aplicacion
+de los demas—.
+
+Por la misma razon, las consultas a DynamoDB, que bloquean, se sacan del bucle
+con `run_in_executor` en lugar de ejecutarse dentro.
+
 Limites declarados, porque conviene nombrarlos antes de que los encuentre otro:
 
 - El testigo se guarda sin cifrar. En Android ese almacenamiento es privado de
@@ -28,71 +50,158 @@ Limites declarados, porque conviene nombrarlos antes de que los encuentre otro:
   otro dispositivo.
 """
 
+import asyncio
+
 from datos import repositorio
 
 CLAVE = "synctask.testigo"
 
 
-def recordar(preferencias, id_usuario):
-    """Emite un testigo y lo guarda en el dispositivo. Devuelve el testigo.
+def _programar(bucle, construir):
+    """Pone una corrutina a correr en el bucle. Devuelve si lo consiguio.
 
-    Si el almacenamiento del dispositivo falla, la sesion sigue siendo valida
-    en esta ejecucion: no poder recordarla es una molestia, no un motivo para
-    impedir el ingreso.
+    `construir` es una funcion que devuelve la corrutina, y no la corrutina ya
+    construida, para poder cerrarla si no llega a programarse: una corrutina
+    creada y nunca ejecutada emite el mismo RuntimeWarning que motivo esta
+    reescritura.
+    """
+    if bucle is None:
+        return False
+    corrutina = construir()
+    try:
+        asyncio.run_coroutine_threadsafe(corrutina, bucle)
+        return True
+    except Exception:  # noqa: BLE001
+        corrutina.close()
+        return False
+
+
+def recordar(bucle, preferencias, id_usuario):
+    """Emite un testigo y pide que se guarde en el dispositivo.
+
+    Se llama desde el hilo de trabajo del ingreso. `crear_testigo` consulta
+    DynamoDB y bloquea, pero ahi bloquear no molesta a nadie. Lo que no se
+    puede hacer desde ese hilo es tocar el almacenamiento del dispositivo, que
+    vive en el bucle; por eso esa mitad se programa.
+
+    Devuelve el testigo de inmediato, sin esperar a que se guarde: si el
+    almacenamiento falla, la sesion sigue siendo valida en esta ejecucion. No
+    poder recordarla es una molestia, no un motivo para impedir el ingreso.
     """
     testigo = repositorio.crear_testigo(id_usuario)
-    try:
-        preferencias.set(CLAVE, testigo)
-    except Exception:
-        return testigo
+
+    async def guardar():
+        try:
+            await preferencias.set(CLAVE, testigo)
+        except Exception:  # noqa: BLE001
+            pass
+
+    _programar(bucle, guardar)
     return testigo
 
 
-def recuperar(preferencias):
-    """Devuelve el perfil del usuario recordado, o None.
+def _resolver(testigo):
+    """Traduce un testigo a un perfil. Corre fuera del bucle.
 
-    Limpia el testigo guardado cuando ya no sirve, para no reintentar la misma
-    consulta inutil en cada apertura.
+    Devuelve `(perfil, caducado)`. La distincion importa: un fallo de red se
+    informa con `caducado=False` para NO borrar el testigo del dispositivo. Si
+    se borrara, un solo arranque sin cobertura cerraria la sesion para siempre,
+    que es justo lo contrario de lo que este modulo existe para evitar.
     """
     try:
-        testigo = preferencias.get(CLAVE)
-    except Exception:
-        return None
-    if not testigo:
-        return None
-
-    try:
         id_usuario = repositorio.usuario_de_testigo(testigo)
-    except Exception:
-        # Un fallo de red al arrancar no debe dejar la aplicacion bloqueada:
-        # se cae con elegancia a la pantalla de ingreso.
-        return None
+    except Exception:  # noqa: BLE001
+        return None, False
 
     if not id_usuario:
-        olvidar(preferencias, revocar=False)
-        return None
+        # La consulta si llego a la base de datos y no hay nadie detras de ese
+        # testigo: caducado o revocado. Ese si se borra, para no repetir la
+        # misma consulta inutil en cada apertura.
+        return None, True
 
     try:
-        return repositorio.obtener_usuario(id_usuario)
-    except Exception:
-        return None
+        return repositorio.obtener_usuario(id_usuario), False
+    except Exception:  # noqa: BLE001
+        return None, False
 
 
-def olvidar(preferencias, revocar=True):
-    """Borra el testigo del dispositivo y, por omision, tambien de la tabla."""
-    testigo = None
-    try:
-        testigo = preferencias.get(CLAVE)
-    except Exception:
-        pass
+def recuperar(bucle, preferencias, al_terminar):
+    """Resuelve la sesion recordada y entrega el perfil a `al_terminar`.
 
-    if revocar and testigo:
+    `al_terminar` recibe el perfil del usuario, o None si no hay sesion que
+    recordar, y se invoca siempre dentro del bucle, que es donde es seguro
+    tocar la interfaz. Se invoca una sola vez, pase lo que pase.
+    """
+
+    def avisar(perfil):
         try:
-            repositorio.revocar_testigo(testigo)
-        except Exception:
+            al_terminar(perfil)
+        except Exception:  # noqa: BLE001
+            # Un fallo pintando la pantalla no debe quedar como excepcion
+            # suelta de una tarea, que no se ve en ningun sitio.
             pass
 
+    async def tarea():
+        try:
+            testigo = await preferencias.get(CLAVE)
+        except Exception:  # noqa: BLE001
+            testigo = None
+
+        if not testigo:
+            avisar(None)
+            return
+
+        try:
+            perfil, caducado = await bucle.run_in_executor(
+                None, _resolver, testigo)
+        except Exception:  # noqa: BLE001
+            avisar(None)
+            return
+
+        if caducado:
+            try:
+                await preferencias.remove(CLAVE)
+            except Exception:  # noqa: BLE001
+                pass
+
+        avisar(perfil)
+
+    if not _programar(bucle, tarea):
+        avisar(None)
+
+
+def olvidar(bucle, preferencias, revocar=True):
+    """Borra el testigo del dispositivo y, por omision, tambien de la tabla.
+
+    El orden no es casual: primero se quita del dispositivo y despues se
+    revoca en la base de datos. Si se hiciera al reves y la revocacion
+    fallara, el telefono se quedaria con una llave que sigue siendo valida.
+    """
+
+    async def tarea():
+        try:
+            testigo = await preferencias.get(CLAVE)
+        except Exception:  # noqa: BLE001
+            testigo = None
+
+        try:
+            await preferencias.remove(CLAVE)
+        except Exception:  # noqa: BLE001
+            pass
+
+        if revocar and testigo:
+            try:
+                await bucle.run_in_executor(
+                    None, _revocar_en_la_tabla, testigo)
+            except Exception:  # noqa: BLE001
+                pass
+
+    _programar(bucle, tarea)
+
+
+def _revocar_en_la_tabla(testigo):
+    """Consulta a DynamoDB, fuera del bucle."""
     try:
-        preferencias.remove(CLAVE)
-    except Exception:
+        repositorio.revocar_testigo(testigo)
+    except Exception:  # noqa: BLE001
         pass
