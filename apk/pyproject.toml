@@ -59,3 +59,40 @@ adaptive_icon_background = "#4F46E5"
 # La aplicacion no sirve sin red. Flutter la agrega por su cuenta, pero se
 # deja explicita para que el manifiesto se lea solo.
 "android.permission.INTERNET" = true
+
+
+# --- Arreglo de una incompatibilidad de terceros (17 de octubre de 2026) ---
+#
+# El 1 de octubre se publico `jni` 1.1.0 y el ecosistema de Flutter empezo a
+# migrar a el. El proyecto Flutter que genera Flet 0.86.5 todavia fija
+# `jni: 1.0.0` en sus dependency_overrides, de modo que cualquier paquete ya
+# migrado recibe una version mas vieja de la que esperan sus enlaces y la
+# compilacion se detiene:
+#
+#   The generated bindings expect package:jni ^1.1.0, but 1.0.x was imported.
+#
+# Aparecio primero con `shared_preferences_android` 2.5.0 (publicado el 17 de
+# octubre) y, al resolver ese, volvio a salir con `jni_flutter` 1.0.4+1. Son
+# dependencias transitivas: ir fijandolas una por una es perseguir sintomas, y
+# manana puede aparecer una tercera.
+#
+# Por eso se sube `jni` en lugar de bajar a quienes lo usan. La decision se
+# apoya en la comprobacion que hace el propio paquete:
+#
+#   actualMajorVersion == major && actualMinorVersion >= minor
+#
+# El menor se compara con `>=`, asi que 1.1.0 satisface tanto a los enlaces
+# generados contra 1.0 como a los generados contra 1.1. Subir es estrictamente
+# mas seguro que quedarse, no menos.
+#
+# El pin de `shared_preferences_android` se conserva por prudencia: 2.4.28, del
+# 28 de agosto, es la ultima que no toca JNI en absoluto, y es la que venia
+# usandose sin problemas. Importa porque `shared_preferences` es donde se
+# guarda el testigo de la sesion recordada (modulos/recordar.py).
+#
+# Ambas lineas sobran cuando Flet actualice su propio pin de `jni`. La senal de
+# que ya se pueden quitar es que build/flutter/pubspec.yaml muestre
+# `jni: 1.1.0` o superior sin que nosotros lo pongamos.
+[tool.flet.flutter.pubspec.dependency_overrides]
+jni = "1.1.0"
+shared_preferences_android = "2.4.28"
