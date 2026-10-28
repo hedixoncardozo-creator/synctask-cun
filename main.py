@@ -249,6 +249,46 @@ def fecha_valida(texto_fecha):
         return False
 
 
+def en_el_bucle(estado, construir):
+    """Unico punto por donde se invoca un servicio de Flet. Devuelve si salio.
+
+    En Flet 0.86 TODOS los metodos de TODOS los servicios —SharedPreferences,
+    Clipboard, HapticFeedback, Connectivity— son asincronos, y ninguno tiene
+    variante sincrona. Llamarlos sin ejecutar devuelve una corrutina que nadie
+    atiende: la operacion no ocurre y no se levanta ningun error visible.
+
+    Este proyecto lo ha sufrido tres veces. Primero la sesion recordada, que
+    no guardaba nada durante semanas. Despues el portapapeles, que anunciaba
+    "Codigo copiado" sin copiar. Y la banda de conexion, que no se mostraba
+    nunca porque iterar la corrutina lanzaba TypeError dentro de un try. Las
+    tres veces el sintoma fue el mismo: la funcion no fallaba, simplemente no
+    hacia nada.
+
+    De ahi este embudo. No es mas corto que repetir el patron en cada sitio;
+    es que deja un solo lugar donde el error puede volver a entrar.
+
+    `construir` devuelve la corrutina en lugar de recibirla ya construida: si
+    no se llega a programar hay que cerrarla, o emite el mismo
+    RuntimeWarning que delato el defecto original.
+    """
+    bucle = getattr(estado, "bucle", None)
+    if bucle is None:
+        return False
+    try:
+        corrutina = construir()
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(corrutina, bucle)
+        return True
+    except Exception:  # noqa: BLE001
+        try:
+            corrutina.close()
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+
 def vibrar(estado, intenso=False):
     """Golpecito en el telefono al llegar un cambio ajeno.
 
@@ -256,15 +296,42 @@ def vibrar(estado, intenso=False):
     notificacion que se puede dar sin salir de la aplicacion, y llega incluso
     cuando el usuario no esta mirando la pantalla.
     """
-    try:
-        if estado.vibracion is None:
-            return
-        if intenso:
-            estado.vibracion.medium_impact()
+    servicio = getattr(estado, "vibracion", None)
+    if servicio is None:
+        return
+    en_el_bucle(
+        estado,
+        lambda: servicio.medium_impact() if intenso else servicio.light_impact(),
+    )
+
+
+def copiar_al_portapapeles(estado, contenido, al_terminar):
+    """Copia texto al portapapeles y responde si de verdad se copio.
+
+    `al_terminar(exito)` se invoca exactamente una vez, siempre dentro del
+    bucle, que es donde es seguro tocar la pantalla.
+
+    Que el aviso dependa del resultado no es un detalle de estilo. La version
+    anterior anunciaba "Codigo copiado" antes de intentarlo siquiera, y por
+    eso el fallo sobrevivio hasta que alguien trato de pegar el codigo en otra
+    aplicacion y no habia nada. Un mensaje de exito que no comprueba el exito
+    no informa: esconde.
+    """
+    servicio = getattr(estado, "portapapeles", None)
+    if servicio is None:
+        al_terminar(False)
+        return
+
+    async def copiar():
+        try:
+            await servicio.set(contenido)
+        except Exception:  # noqa: BLE001
+            al_terminar(False)
         else:
-            estado.vibracion.light_impact()
-    except Exception:  # noqa: BLE001
-        pass
+            al_terminar(True)
+
+    if not en_el_bucle(estado, copiar):
+        al_terminar(False)
 
 
 def avisar(page, mensaje, color=None):
@@ -1406,13 +1473,18 @@ def vista_tablero(page, estado, id_proyecto):
         Antes el codigo era solo texto seleccionable, lo que en un telefono
         obliga a mantener pulsado, ajustar la seleccion y copiar. Un toque
         basta.
+
+        El aviso se da despues de saber el resultado, no antes. Ver
+        `copiar_al_portapapeles`.
         """
-        try:
-            estado.portapapeles.set(codigo_acceso)
-            avisar(page, "Codigo copiado.", Tono.EXITO)
-        except Exception:  # noqa: BLE001
-            avisar(page, "No se pudo copiar; seleccione el codigo a mano.",
-                   Tono.PELIGRO)
+        def al_terminar(exito):
+            if exito:
+                avisar(page, "Codigo copiado.", Tono.EXITO)
+            else:
+                avisar(page, "No se pudo copiar; seleccione el codigo a mano.",
+                       Tono.PELIGRO)
+
+        copiar_al_portapapeles(estado, codigo_acceso, al_terminar)
 
     def guardar_tarea(e):
         if not titulo_tarea.value or not titulo_tarea.value.strip():
@@ -2073,9 +2145,19 @@ def main(page: ft.Page):
     page.theme_mode = ft.ThemeMode.LIGHT
 
     def al_cambiar_conexion(e=None):
-        """REQ-10: avisar de la perdida de red y de su recuperacion."""
+        """REQ-10: avisar de la perdida de red y de su recuperacion.
+
+        Los tipos de conexion se leen del propio evento y no llamando a
+        `get_connectivity()`. Ese metodo es asincrono: invocarlo sin ejecutar
+        devolvia una corrutina, recorrerla lanzaba TypeError, y el `except` de
+        abajo se lo tragaba. El resultado es que esta funcion no hacia
+        absolutamente nada y la banda de conexion no aparecia nunca. Leer del
+        evento ademas evita una ida y vuelta al telefono.
+        """
+        tipos = getattr(e, "connectivity", None) if e is not None else None
+        if tipos is None:
+            return
         try:
-            tipos = conectividad.get_connectivity()
             perdida = (not tipos) or all(t == ft.ConnectivityType.NONE
                                          for t in tipos)
         except Exception:  # noqa: BLE001
