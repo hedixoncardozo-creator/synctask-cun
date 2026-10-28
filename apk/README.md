@@ -59,11 +59,32 @@ crear.
 
 Desde esta carpeta, y son **tres** comandos, no uno:
 
+Antes de la primera vez, en la maquina que compila:
+
 ```
-flet build apk --yes -vv
+pip install flet==0.86.5 flet-cli==0.86.5 flet-notifications==0.1.4
+```
+
+`flet-notifications` hace falta aqui ademas de en el servidor, y por un motivo
+distinto: en el servidor es la mitad de Python que pide mostrar el aviso; aqui
+es el parcheador que prepara el proyecto de Android. Tenerlo solo en el
+servidor no sirve para compilar.
+
+Luego, desde esta carpeta, son **tres** comandos:
+
+```
+python -m flet.cli build apk --yes -vv
 python -m flet_notifications.patcher --foreground-service-type dataSync
-flet build apk --yes -vv
+python -m flet.cli build apk --yes -vv
 ```
+
+Se invoca `python -m flet.cli` y no `flet` a secas a proposito: el comando
+`flet` vive en la carpeta de scripts de Python, que en una instalacion de
+Windows desde la Microsoft Store no suele estar en el PATH. Llamar al modulo
+funciona igual y no depende de como este configurado el PATH.
+
+Para instalar encima de un APK ya instalado, agregue `--build-number N` a los
+dos comandos de compilacion, subiendo N en cada version.
 
 El APK queda en `build/apk/synctask.apk`.
 
