@@ -347,6 +347,32 @@ def avisar(page, mensaje, color=None):
     )
 
 
+def _etiqueta_de_espera(texto_espera, control):
+    """Rueda girando junto al texto, en lugar de solo cambiar el texto.
+
+    Un texto que cambia de "Ingresar" a "Verificando..." es un cambio
+    pequeno y estatico: en un telefono, con el dedo encima del boton, pasa
+    desapercibido. Una rueda girando se lee como "esta trabajando" sin tener
+    que leer nada, y sobre todo *se mueve*, que es lo que distingue una
+    aplicacion ocupada de una colgada.
+
+    El color se toma del propio boton para que sirva igual en los claros y en
+    los de acento.
+    """
+    tinta = getattr(control, "color", None) or ft.Colors.WHITE
+    return ft.Row(
+        tight=True,
+        spacing=10,
+        alignment=ft.MainAxisAlignment.CENTER,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        controls=[
+            ft.ProgressRing(width=15, height=15, stroke_width=2, color=tinta),
+            ft.Text(value=texto_espera, size=14, weight=ft.FontWeight.W_600,
+                    color=tinta),
+        ],
+    )
+
+
 def ejecutar_fuera_del_hilo(page, estado, control, etiqueta_espera, trabajo,
                             al_terminar):
     """Ejecuta una escritura en otro hilo y muestra que se esta trabajando.
@@ -362,22 +388,32 @@ def ejecutar_fuera_del_hilo(page, estado, control, etiqueta_espera, trabajo,
     devolucion, un registro correcto terminaba sin error visible y sin
     cambiar de pantalla: el fallo mas dificil de diagnosticar de todos, el que
     no deja rastro.
+
+    `al_terminar` puede devolver True para decir "ya cambie de pantalla, no
+    devuelvas el boton a su estado normal". Importa mas de lo que parece:
+    grabando un ingreso en un telefono a diez fotogramas por segundo se vio
+    la secuencia "Ingresar" -> "Verificando..." -> "Ingresar" -> tablero. El
+    boton volvia a su texto original ANTES de que la pantalla cambiara, y ese
+    parpadeo se lee como que la pulsacion no hizo nada. Con True, el boton se
+    queda esperando hasta que la pantalla nueva lo reemplaza.
     """
     etiqueta_original = control.content
     icono_original = control.icon
     control.disabled = True
-    control.content = etiqueta_espera
+    control.content = _etiqueta_de_espera(etiqueta_espera, control)
     control.icon = None
     page.update()
 
     def devolver(resultado, error):
-        control.disabled = False
-        control.content = etiqueta_original
-        control.icon = icono_original
+        navego = False
         try:
-            al_terminar(resultado, error)
+            navego = bool(al_terminar(resultado, error))
         except Exception:  # noqa: BLE001
-            pass
+            navego = False
+        if not navego:
+            control.disabled = False
+            control.content = etiqueta_original
+            control.icon = icono_original
         try:
             page.update()
         except Exception:  # noqa: BLE001
@@ -824,9 +860,12 @@ def vista_ingreso(page, estado):
             estado.usuario = usuario
             iniciar_vigilancia(estado)
             page.navigate("/proyectos")
+            # True = la pantalla ya cambio; que el boton no vuelva a
+            # "Ingresar" en el intervalo, porque se lee como que no paso nada.
+            return True
 
-        ejecutar_fuera_del_hilo(page, estado, boton_entrar, "Verificando...", trabajo,
-                                al_terminar)
+        ejecutar_fuera_del_hilo(page, estado, boton_entrar, "Iniciando sesion...",
+                                trabajo, al_terminar)
 
     boton_entrar = boton("Ingresar", entrar, ft.Icons.ARROW_FORWARD)
     clave.on_submit = entrar
@@ -951,6 +990,7 @@ def vista_registro(page, estado):
             iniciar_vigilancia(estado)
             avisar(page, "Cuenta creada. Bienvenido.", Tono.EXITO)
             page.navigate("/proyectos")
+            return True
 
         ejecutar_fuera_del_hilo(page, estado, boton_crear, "Creando...", trabajo,
                                 al_terminar)
@@ -1068,6 +1108,7 @@ def vista_proyectos(page, estado):
             avisar(page, f"Se vinculo a {proyecto.get('nombre', 'el proyecto')}.",
                    Tono.EXITO)
             page.navigate("/tablero/" + proyecto["PK"].split("#", 1)[1])
+            return True
 
         ejecutar_fuera_del_hilo(page, estado, boton_unirme, "Buscando...", trabajo,
                                 al_terminar)
@@ -1091,6 +1132,7 @@ def vista_proyectos(page, estado):
             avisar(page, f"Proyecto creado. Codigo: {proyecto.get('codigo_acceso','')}",
                    Tono.EXITO)
             page.navigate("/tablero/" + proyecto["PK"].split("#", 1)[1])
+            return True
 
         ejecutar_fuera_del_hilo(page, estado, boton_crear, "Creando...", trabajo,
                                 al_terminar)
