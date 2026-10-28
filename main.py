@@ -733,43 +733,56 @@ def vista_restaurando(page, estado):
     que la persona percibe es "me esta volviendo a pedir la contrasena", y el
     salto posterior refuerza la sensacion de lentitud.
 
-    La cabecera es deliberadamente identica a la de `vista_ingreso` —mismo
-    logo, mismo tamano, misma posicion—. Asi, cuando no hay sesion que
-    recordar, el formulario aparece debajo sin que nada se mueva de sitio: el
-    cambio se siente como que la pantalla termino de cargar, no como que
-    cambio de pantalla.
+    Es deliberadamente indistinguible del splash de Android: mismo fondo
+    indigo, misma marca blanca al centro. Grabando el arranque en un telefono
+    se vio que la secuencia real era splash indigo -> pantalla blanca casi
+    vacia -> blanco con logo y rueda -> tablero: 1,6 segundos en tres
+    pantallas distintas. El tiempo no era el problema; verlo pasar si.
+
+    Pintada como el splash, junto con la pantalla de arranque de la cascara
+    —que tambien se puso indigo—, el arranque entero se lee como un unico
+    splash que termina cuando aparece el tablero. No se gana un milisegundo;
+    se deja de ver la maquinaria, que es lo que de verdad molestaba.
+
+    La rueda va abajo y es tenue a proposito: anuncia que algo avanza sin
+    pedir que se la mire.
     """
     return ft.View(
         route="/",
-        bgcolor=Tono.FONDO,
+        bgcolor=Tono.ACENTO,
         controls=[
-            centrar(
-                estado,
-                [
-                    ft.Container(height=26),
-                    ft.Row(alignment=ft.MainAxisAlignment.CENTER,
-                           controls=[marca_sync(46)]),
-                    ft.Container(height=2),
-                    ft.Text(value="SyncTask CUN", size=26,
-                            weight=ft.FontWeight.W_700, color=Tono.TINTA,
-                            text_align=ft.TextAlign.CENTER),
-                    ft.Text(
-                        value="Las tareas del equipo, iguales para todos y al instante",
-                        size=13, color=Tono.TINTA_SUAVE,
-                        text_align=ft.TextAlign.CENTER),
-                    ft.Container(height=22),
-                    ft.Row(
-                        alignment=ft.MainAxisAlignment.CENTER,
-                        controls=[
-                            ft.ProgressRing(width=22, height=22, stroke_width=2.5,
+            ft.Container(
+                expand=True,
+                alignment=ft.Alignment.CENTER,
+                content=ft.Column(
+                    alignment=ft.MainAxisAlignment.CENTER,
+                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                    spacing=0,
+                    controls=[
+                        ft.Container(
+                            width=78,
+                            height=78,
+                            bgcolor=ft.Colors.WHITE,
+                            border_radius=ft.BorderRadius.all(24),
+                            alignment=ft.Alignment.CENTER,
+                            content=ft.Text(value="ST", size=33,
+                                            weight=ft.FontWeight.W_700,
                                             color=Tono.ACENTO),
-                        ],
-                    ),
-                ],
+                        ),
+                        ft.Container(height=26),
+                        ft.Text(value="SyncTask CUN", size=20,
+                                weight=ft.FontWeight.W_600,
+                                color=ft.Colors.WHITE,
+                                text_align=ft.TextAlign.CENTER),
+                        ft.Container(height=34),
+                        ft.ProgressRing(width=20, height=20, stroke_width=2.2,
+                                        color=ft.Colors.with_opacity(
+                                            0.55, ft.Colors.WHITE)),
+                    ],
+                ),
             )
         ],
         padding=ft.Padding.all(0),
-        scroll=ft.ScrollMode.AUTO,
     )
 
 

@@ -121,9 +121,19 @@ def main(page: ft.Page) -> None:
             reconnect_timeout_ms=TIEMPO_TOTAL_DE_INTENTOS_MS,
             boot_screen_options={
                 "spinner_size": 32,
-                "startup_message": "Conectando con SyncTask...",
-                "bgcolor_light": Tono.FONDO,
-                "bgcolor_dark": Tono.FONDO,
+                "startup_message": "",
+                # Indigo, el mismo color del splash de Android. No es un
+                # capricho estetico: grabando el arranque en un telefono se
+                # vio que la secuencia real era splash indigo -> pantalla
+                # blanca casi vacia -> blanco con logo y rueda -> tablero.
+                # Son 1,6 segundos, que no es mucho; lo que molestaba era ver
+                # tres pantallas distintas pasar de largo.
+                #
+                # Pintando esta del color del splash, el splash no parece
+                # terminar: se mantiene mientras se abre la conexion. El
+                # tiempo es identico, pero deja de verse la maquinaria.
+                "bgcolor_light": Tono.ACENTO,
+                "bgcolor_dark": Tono.ACENTO,
             },
             app_error_message=MENSAJE_DE_RESERVA,
             on_error=al_fallar,
