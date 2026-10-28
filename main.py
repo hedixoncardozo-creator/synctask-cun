@@ -2255,6 +2255,14 @@ def main(page: ft.Page):
         ft.PagePlatform.ANDROID_TV,
         ft.PagePlatform.IOS,
     )
+    # Queda escrito en el diario del servicio que cliente se conecto y si se
+    # le engancho el servicio de notificaciones. Sin esto no habia forma de
+    # distinguir "el telefono rechazo la notificacion" de "al telefono nunca
+    # se le ofrecio", que son problemas distintos con arreglos distintos.
+    notificaciones.registrar(
+        f"sesion nueva: web={page.web} platform={page.platform} "
+        f"-> en_telefono={en_telefono}"
+    )
     notificador = notificaciones.crear_servicio() if en_telefono else None
 
     servicios = [preferencias, portapapeles, conectividad, vibracion]

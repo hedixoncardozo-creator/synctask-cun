@@ -65,40 +65,91 @@ TIPO_DE_SERVICIO = "dataSync"
 _contador = {"n": 1000}
 
 
+# --- Diagnostico ---------------------------------------------------------
+#
+# Todas las funciones de este modulo se tragan sus errores a proposito: una
+# notificacion es una comodidad y que falle no puede impedir trabajar. El
+# precio de esa decision es que, cuando algo no funciona, no queda rastro.
+#
+# Ya paso dos veces. Se declaro el servicio en primer plano, se comprobo que
+# estaba en el manifiesto del APK, y aun asi las notificaciones seguian sin
+# llegar con la aplicacion cerrada, sin una sola linea que dijera por que.
+#
+# De ahi este registro. No cambia el comportamiento —se sigue tragando todo—
+# pero deja escrito en el diario del servicio que se intento y como salio. Se
+# lee con:
+#
+#     journalctl -u synctask -n 200 --no-pager | grep NOTIF
+#
+# Cada linea lleva el prefijo NOTIF para poder filtrarla.
+
+def registrar(mensaje):
+    """Escribe una linea en el diario del servicio. Nunca falla."""
+    try:
+        print(f"NOTIF {mensaje}", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _fallo(donde, error):
+    registrar(f"{donde} FALLO {type(error).__name__}: {error}")
+
+
 def crear_servicio():
     """Devuelve el servicio, o None si la extension no esta disponible."""
     if not DISPONIBLE:
+        registrar("crear_servicio: la extension flet_notifications NO se pudo "
+                  "importar en el servidor")
         return None
     try:
-        return LocalNotifications()
-    except Exception:  # noqa: BLE001
+        servicio = LocalNotifications()
+        registrar("crear_servicio: servicio creado")
+        return servicio
+    except Exception as error:  # noqa: BLE001
+        _fallo("crear_servicio", error)
         return None
 
 
 def preparar(bucle, servicio):
-    """Inicializa el servicio y pide el permiso de Android 13 o superior.
+    """Inicializa el servicio, pide permisos y deja constancia del resultado.
 
     Se programa en el bucle de eventos porque la extension es asincrona. No se
     espera el resultado: si el usuario tarda en responder al permiso, la
     aplicacion no debe quedarse esperandolo.
     """
     if servicio is None or bucle is None:
+        registrar(f"preparar: no se puede (servicio={servicio is not None}, "
+                  f"bucle={bucle is not None})")
         return
 
     async def arranque():
         try:
             await servicio.initialize()
-        except Exception:  # noqa: BLE001
+            registrar("initialize: OK")
+        except Exception as error:  # noqa: BLE001
+            _fallo("initialize", error)
             return
+
         try:
-            await servicio.request_permissions()
-        except Exception:  # noqa: BLE001
-            pass
+            concedido = await servicio.request_permissions()
+            registrar(f"request_permissions: {concedido}")
+        except Exception as error:  # noqa: BLE001
+            _fallo("request_permissions", error)
+
+        # Esta es la pregunta que de verdad importa: si Android dice que no,
+        # ninguna notificacion va a aparecer por mas que se pidan.
+        try:
+            activadas = await servicio.are_notifications_enabled()
+            registrar(f"are_notifications_enabled: {activadas}"
+                      + ("" if activadas else
+                         "  <-- ANDROID LAS TIENE BLOQUEADAS PARA ESTA APP"))
+        except Exception as error:  # noqa: BLE001
+            _fallo("are_notifications_enabled", error)
 
     try:
         asyncio.run_coroutine_threadsafe(arranque(), bucle)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as error:  # noqa: BLE001
+        _fallo("preparar/programar", error)
 
 
 def mostrar(bucle, servicio, titulo, cuerpo):
@@ -125,13 +176,14 @@ def mostrar(bucle, servicio, titulo, cuerpo):
                 # seguidos no llenen la bandeja con avisos sueltos.
                 group_key=CANAL,
             )
-        except Exception:  # noqa: BLE001
-            pass
+            registrar(f"show #{identificador}: OK  {cuerpo[:60]!r}")
+        except Exception as error:  # noqa: BLE001
+            _fallo(f"show #{identificador}", error)
 
     try:
         asyncio.run_coroutine_threadsafe(lanzar(), bucle)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as error:  # noqa: BLE001
+        _fallo("mostrar/programar", error)
 
 
 def iniciar_vigilancia(bucle, servicio):
@@ -148,6 +200,8 @@ def iniciar_vigilancia(bucle, servicio):
     plano" que solo genera desconfianza.
     """
     if servicio is None or bucle is None:
+        registrar(f"iniciar_vigilancia: no se puede "
+                  f"(servicio={servicio is not None}, bucle={bucle is not None})")
         return False
 
     async def arrancar():
@@ -159,15 +213,28 @@ def iniciar_vigilancia(bucle, servicio):
                 channel_id=CANAL_VIGILANCIA,
                 foreground_service_types=[TIPO_DE_SERVICIO],
             )
-        except Exception:  # noqa: BLE001
+            registrar("start_foreground_service: OK  <-- el aviso permanente "
+                      "deberia verse ya en la bandeja")
+        except Exception as error:  # noqa: BLE001
             # Si el telefono lo rechaza, la aplicacion sigue funcionando
-            # exactamente como antes: con avisos dentro de la pantalla.
-            pass
+            # exactamente como antes: con avisos dentro de la pantalla. Pero
+            # ahora queda escrito por que.
+            _fallo("start_foreground_service", error)
+
+        # Comprueba si el aviso llego de verdad a la bandeja. Es la diferencia
+        # entre "se pidio" y "esta puesto", que es justo lo que no sabiamos.
+        try:
+            activas = await servicio.get_active_notifications()
+            ids = [getattr(a, "id", "?") for a in (activas or [])]
+            registrar(f"get_active_notifications: {len(ids)} activa(s), ids={ids}")
+        except Exception as error:  # noqa: BLE001
+            _fallo("get_active_notifications", error)
 
     try:
         asyncio.run_coroutine_threadsafe(arrancar(), bucle)
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as error:  # noqa: BLE001
+        _fallo("iniciar_vigilancia/programar", error)
         return False
 
 
