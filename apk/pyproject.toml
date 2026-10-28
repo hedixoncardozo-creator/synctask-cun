@@ -60,6 +60,20 @@ adaptive_icon_background = "#4F46E5"
 # deja explicita para que el manifiesto se lea solo.
 "android.permission.INTERNET" = true
 
+# Servicio en primer plano. Es lo que permite que las notificaciones lleguen
+# con la aplicacion fuera de pantalla o el telefono bloqueado: mantiene viva
+# la conexion con el servidor, a cambio de un aviso permanente en la bandeja.
+#
+# El segundo permiso es obligatorio desde Android 14, y el tipo que declara
+# —sincronizacion de datos— tiene que coincidir con el que pide el codigo en
+# modulos/notificaciones.py.
+#
+# El parcheador de la extension tambien los agrega; se declaran aqui ademas
+# para que el manifiesto se entienda leyendo solo este archivo. No se
+# duplican: el parcheador comprueba antes de insertar.
+"android.permission.FOREGROUND_SERVICE" = true
+"android.permission.FOREGROUND_SERVICE_DATA_SYNC" = true
+
 
 # --- Arreglo de una incompatibilidad de terceros (17 de octubre de 2026) ---
 #

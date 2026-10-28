@@ -61,27 +61,42 @@ class PreferenciasFalsas:
 
 
 class RepositorioFalso:
+    """Imita la tabla. Cuenta consultas: es lo que se quiere medir."""
+
     def __init__(self):
+        # testigo -> {"id": str, "perfil": dict | None}
+        # perfil None imita los testigos emitidos antes de guardar la copia.
         self.testigos = {}
-        self.usuarios = {"u1": {"id_usuario": "u1", "nombre": "Ana"}}
+        self.usuarios = {"u1": {"id_usuario": "u1", "nombre": "Ana",
+                                "correo": "ana@cun.edu.co"}}
         self.revocados = []
-        self.consultas = []
+        self.consultas = []          # lecturas del testigo
+        self.perfiles_pedidos = []   # lecturas del perfil (la segunda consulta)
         self.caer = False
         self.contador = 0
 
-    def crear_testigo(self, id_usuario):
+    def crear_testigo(self, id_usuario, perfil=None):
         self.contador += 1
         testigo = f"testigo-{self.contador}"
-        self.testigos[testigo] = id_usuario
+        self.testigos[testigo] = {"id": id_usuario, "perfil": perfil}
         return testigo
 
-    def usuario_de_testigo(self, testigo):
+    def sesion_de_testigo(self, testigo):
         self.consultas.append(testigo)
         if self.caer:
             raise RuntimeError("sin red")
-        return self.testigos.get(testigo)
+        dato = self.testigos.get(testigo)
+        if not dato:
+            return None, None
+        perfil = dato["perfil"]
+        if perfil is None:
+            return dato["id"], None
+        return dato["id"], {"id_usuario": dato["id"],
+                            "nombre": perfil.get("nombre", ""),
+                            "correo": perfil.get("correo", "")}
 
     def obtener_usuario(self, id_usuario):
+        self.perfiles_pedidos.append(id_usuario)
         return self.usuarios.get(id_usuario)
 
     def revocar_testigo(self, testigo):
@@ -116,7 +131,9 @@ async def principal():
     emitido = {}
 
     def ingresar():
-        emitido["testigo"] = recordar.recordar(bucle, prefs, "u1")
+        emitido["testigo"] = recordar.recordar(
+            bucle, prefs, {"id_usuario": "u1", "nombre": "Ana",
+                           "correo": "ana@cun.edu.co"})
 
     hilo = threading.Thread(target=ingresar)
     hilo.start()
@@ -132,9 +149,39 @@ async def principal():
 
     perfil = await recuperar_esperando(bucle, prefs)
     comprobar("Al abrir de nuevo se recupera el usuario correcto",
-              perfil == {"id_usuario": "u1", "nombre": "Ana"}, f"{perfil}")
+              perfil == {"id_usuario": "u1", "nombre": "Ana",
+                         "correo": "ana@cun.edu.co"}, f"{perfil}")
     comprobar("La tabla se consulto con el testigo, no con un objeto suelto",
               repo.consultas == [emitido["testigo"]], f"{repo.consultas}")
+
+    print("\nCuantas consultas cuesta reabrir la aplicacion")
+
+    comprobar("Un testigo nuevo se resuelve con UNA sola consulta",
+              len(repo.consultas) == 1 and repo.perfiles_pedidos == [],
+              f"{len(repo.consultas)} al testigo, "
+              f"{len(repo.perfiles_pedidos)} al perfil "
+              "(antes eran dos seguidas, y el telefono esperaba las dos)")
+
+    # Un testigo de los que ya estan en los telefonos del equipo: se emitio
+    # antes de que se guardara la copia del perfil.
+    viejas = PreferenciasFalsas()
+    repo.contador += 100
+    antiguo = "testigo-antiguo"
+    repo.testigos[antiguo] = {"id": "u1", "perfil": None}
+    viejas.datos[recordar.CLAVE] = antiguo
+    repo.consultas.clear()
+    repo.perfiles_pedidos.clear()
+
+    perfil_viejo = await recuperar_esperando(bucle, viejas)
+    comprobar("Un testigo antiguo sigue funcionando",
+              perfil_viejo == {"id_usuario": "u1", "nombre": "Ana",
+                               "correo": "ana@cun.edu.co"}, f"{perfil_viejo}")
+    comprobar("Y para el si se hace la segunda consulta",
+              repo.perfiles_pedidos == ["u1"],
+              "nadie tiene que volver a ingresar por este cambio")
+    repo.consultas.clear()
+    repo.perfiles_pedidos.clear()
+    repo.consultas.append(emitido["testigo"])
 
     print("\nCuando no hay sesion que recordar")
 

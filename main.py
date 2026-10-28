@@ -124,6 +124,13 @@ class Estado:
         self.banda = None
         self.vibracion = None
         self.notificador = None
+        # Arranca en True y solo se apaga cuando `recordar.recuperar` responde,
+        # haya sesion que restaurar o no. Mientras tanto el enrutador muestra
+        # la espera en lugar del formulario de ingreso.
+        self.restaurando = True
+        # Si el servicio en primer plano llego a arrancar, para no pedir que se
+        # detenga uno que nunca empezo.
+        self.servicio_activo = False
         self.preferencias = None
         self.portapapeles = None
         # Bucle de eventos de esta sesion. Se captura en main(), que si corre
@@ -583,6 +590,32 @@ def barra(page, estado, titulo_texto, con_volver=False, ruta_de_regreso=None,
     )
 
 
+def iniciar_vigilancia(estado):
+    """Pide a Android que mantenga viva la aplicacion mientras haya sesion.
+
+    Sin esto, las notificaciones solo llegan con la aplicacion en pantalla. El
+    motivo es la arquitectura: el aviso lo dispara el servidor por la conexion
+    abierta, de modo que cuando Android suspende la aplicacion no hay conexion
+    por la que avise nada. Un servicio en primer plano mantiene vivo el proceso
+    —y con el la conexion— a cambio de un aviso permanente en la bandeja.
+
+    Es una mitigacion, no una cura: ver los limites declarados en
+    modulos/notificaciones.py.
+    """
+    if estado.servicio_activo:
+        return
+    if notificaciones.iniciar_vigilancia(estado.bucle, estado.notificador):
+        estado.servicio_activo = True
+
+
+def detener_vigilancia(estado):
+    """Retira el aviso permanente. Se llama al cerrar sesion."""
+    if not estado.servicio_activo:
+        return
+    notificaciones.detener_vigilancia(estado.bucle, estado.notificador)
+    estado.servicio_activo = False
+
+
 def cerrar_sesion(page, estado):
     """Cierra la sesion, revoca el testigo y suelta la suscripcion (REQ-11).
 
@@ -591,6 +624,10 @@ def cerrar_sesion(page, estado):
     teniendo una llave valida.
     """
     soltar_suscripcion(page, estado)
+    # El aviso permanente se retira antes que nada: dejar "SyncTask esta
+    # atento a los cambios" en la bandeja de alguien que acaba de cerrar
+    # sesion seria desconcertante, y ademas falso.
+    detener_vigilancia(estado)
     try:
         # No se espera a que termine: borrar el testigo y revocarlo en la
         # tabla ocurre en segundo plano. Hacer esperar a alguien que acaba de
@@ -620,6 +657,55 @@ def soltar_suscripcion(page, estado):
 # ===========================================================================
 
 
+def vista_restaurando(page, estado):
+    """Espera breve mientras se resuelve si hay sesion recordada (REQ-11).
+
+    Esta pantalla existe por un motivo que se descubrio usando la aplicacion,
+    no probandola: al reabrirla aparecia el formulario de ingreso y medio
+    segundo despues saltaba al tablero. Funcionalmente era correcto, pero lo
+    que la persona percibe es "me esta volviendo a pedir la contrasena", y el
+    salto posterior refuerza la sensacion de lentitud.
+
+    La cabecera es deliberadamente identica a la de `vista_ingreso` —mismo
+    logo, mismo tamano, misma posicion—. Asi, cuando no hay sesion que
+    recordar, el formulario aparece debajo sin que nada se mueva de sitio: el
+    cambio se siente como que la pantalla termino de cargar, no como que
+    cambio de pantalla.
+    """
+    return ft.View(
+        route="/",
+        bgcolor=Tono.FONDO,
+        controls=[
+            centrar(
+                estado,
+                [
+                    ft.Container(height=26),
+                    ft.Row(alignment=ft.MainAxisAlignment.CENTER,
+                           controls=[marca_sync(46)]),
+                    ft.Container(height=2),
+                    ft.Text(value="SyncTask CUN", size=26,
+                            weight=ft.FontWeight.W_700, color=Tono.TINTA,
+                            text_align=ft.TextAlign.CENTER),
+                    ft.Text(
+                        value="Las tareas del equipo, iguales para todos y al instante",
+                        size=13, color=Tono.TINTA_SUAVE,
+                        text_align=ft.TextAlign.CENTER),
+                    ft.Container(height=22),
+                    ft.Row(
+                        alignment=ft.MainAxisAlignment.CENTER,
+                        controls=[
+                            ft.ProgressRing(width=22, height=22, stroke_width=2.5,
+                                            color=Tono.ACENTO),
+                        ],
+                    ),
+                ],
+            )
+        ],
+        padding=ft.Padding.all(0),
+        scroll=ft.ScrollMode.AUTO,
+    )
+
+
 def vista_ingreso(page, estado):
     correo = campo("Correo institucional", keyboard_type=ft.KeyboardType.EMAIL,
                    autofocus=True)
@@ -642,8 +728,7 @@ def vista_ingreso(page, estado):
         def trabajo():
             usuario = sesion.autenticar(*datos)
             if usuario:
-                recordar.recordar(estado.bucle, estado.preferencias,
-                                  usuario["id_usuario"])
+                recordar.recordar(estado.bucle, estado.preferencias, usuario)
             return usuario
 
         def al_terminar(usuario, fallo):
@@ -657,6 +742,7 @@ def vista_ingreso(page, estado):
                 mostrar_error("El correo o la contrasena no coinciden.")
                 return
             estado.usuario = usuario
+            iniciar_vigilancia(estado)
             page.navigate("/proyectos")
 
         ejecutar_fuera_del_hilo(page, estado, boton_entrar, "Verificando...", trabajo,
@@ -774,8 +860,7 @@ def vista_registro(page, estado):
 
         def trabajo():
             usuario = sesion.registrar_usuario(datos[0], datos[1], datos[2], True)
-            recordar.recordar(estado.bucle, estado.preferencias,
-                              usuario["id_usuario"])
+            recordar.recordar(estado.bucle, estado.preferencias, usuario)
             return usuario
 
         def al_terminar(usuario, fallo):
@@ -783,6 +868,7 @@ def vista_registro(page, estado):
                 mostrar_error(str(fallo))
                 return
             estado.usuario = usuario
+            iniciar_vigilancia(estado)
             avisar(page, "Cuenta creada. Bienvenido.", Tono.EXITO)
             page.navigate("/proyectos")
 
@@ -2064,6 +2150,18 @@ def main(page: ft.Page):
         ruta = page.route or "/"
         partes = [p for p in ruta.split("/") if p]
 
+        # Mientras se resuelve si hay sesion recordada no se pinta el ingreso
+        # ni se expulsa de una ruta protegida: se muestra una espera breve.
+        #
+        # El segundo efecto es el que no se ve pero importa: sin esto, abrir un
+        # enlace directo a un tablero expulsaba a "/" por la comprobacion de
+        # abajo —todavia no hay usuario— y la restauracion terminaba llevando a
+        # la lista de proyectos. El enlace se perdia por una carrera. Ahora la
+        # ruta se conserva hasta saber quien es.
+        if estado.restaurando and not estado.usuario:
+            mostrar(vista_restaurando(page, estado))
+            return
+
         # Ninguna pantalla distinta del ingreso y el registro se construye sin
         # usuario autenticado: una direccion escrita a mano no debe conceder
         # acceso (REQ-07, REQ-11).
@@ -2156,15 +2254,23 @@ def main(page: ft.Page):
     # leer el dispositivo es asincrono, y aqui estamos dentro del bucle de
     # eventos, donde esperar un resultado congelaria la aplicacion de todos
     # los usuarios conectados. Ver la explicacion en modulos/recordar.py.
-    if not estado.usuario:
+    if estado.usuario:
+        estado.restaurando = False
+    else:
         def al_recuperar(recordado):
-            if not recordado:
-                return
+            # Se apaga SIEMPRE, haya sesion o no: es lo que destraba la
+            # pantalla de espera. Si esto no ocurriera, la aplicacion se
+            # quedaria girando para siempre, asi que va lo primero.
+            estado.restaurando = False
+
             # Si mientras se resolvia el testigo la persona ya ingreso a mano,
             # no se la mueve de donde esta.
-            if estado.usuario:
+            if not recordado or estado.usuario:
+                al_cambiar_de_ruta()
                 return
+
             estado.usuario = recordado
+            iniciar_vigilancia(estado)
             destino = page.route or "/"
             if destino in ("/", "/registro"):
                 page.navigate("/proyectos")
@@ -2174,7 +2280,10 @@ def main(page: ft.Page):
         try:
             recordar.recuperar(estado.bucle, preferencias, al_recuperar)
         except Exception:  # noqa: BLE001
-            pass
+            # Si ni siquiera se pudo lanzar la consulta, no se puede dejar al
+            # usuario mirando la espera: se cae al formulario de ingreso.
+            estado.restaurando = False
+            al_cambiar_de_ruta()
 
 
 if __name__ == "__main__":

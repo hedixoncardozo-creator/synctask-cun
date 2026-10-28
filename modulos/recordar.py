@@ -76,8 +76,13 @@ def _programar(bucle, construir):
         return False
 
 
-def recordar(bucle, preferencias, id_usuario):
+def recordar(bucle, preferencias, usuario):
     """Emite un testigo y pide que se guarde en el dispositivo.
+
+    Recibe el diccionario completo del usuario y no solo su identificador,
+    porque junto al testigo se guarda una copia de su nombre y su correo. Esa
+    copia es la que permite restaurar la sesion con una sola consulta en la
+    siguiente apertura, en lugar de dos; ver `repositorio.crear_testigo`.
 
     Se llama desde el hilo de trabajo del ingreso. `crear_testigo` consulta
     DynamoDB y bloquea, pero ahi bloquear no molesta a nadie. Lo que no se
@@ -88,7 +93,7 @@ def recordar(bucle, preferencias, id_usuario):
     almacenamiento falla, la sesion sigue siendo valida en esta ejecucion. No
     poder recordarla es una molestia, no un motivo para impedir el ingreso.
     """
-    testigo = repositorio.crear_testigo(id_usuario)
+    testigo = repositorio.crear_testigo(usuario["id_usuario"], usuario)
 
     async def guardar():
         try:
@@ -107,9 +112,13 @@ def _resolver(testigo):
     informa con `caducado=False` para NO borrar el testigo del dispositivo. Si
     se borrara, un solo arranque sin cobertura cerraria la sesion para siempre,
     que es justo lo contrario de lo que este modulo existe para evitar.
+
+    El camino normal resuelve con UNA consulta, porque el testigo lleva una
+    copia del perfil. La segunda consulta solo ocurre con testigos emitidos
+    antes de ese cambio, que siguen siendo validos hasta que caduquen.
     """
     try:
-        id_usuario = repositorio.usuario_de_testigo(testigo)
+        id_usuario, perfil = repositorio.sesion_de_testigo(testigo)
     except Exception:  # noqa: BLE001
         return None, False
 
@@ -119,6 +128,10 @@ def _resolver(testigo):
         # misma consulta inutil en cada apertura.
         return None, True
 
+    if perfil is not None:
+        return perfil, False
+
+    # Testigo antiguo, sin copia del perfil: hay que completar.
     try:
         return repositorio.obtener_usuario(id_usuario), False
     except Exception:  # noqa: BLE001

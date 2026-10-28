@@ -57,13 +57,49 @@ crear.
 
 ## Compilar
 
-Desde esta carpeta:
+Desde esta carpeta, y son **tres** comandos, no uno:
 
 ```
-flet build apk
+flet build apk --yes -vv
+python -m flet_notifications.patcher --foreground-service-type dataSync
+flet build apk --yes -vv
 ```
 
-El APK queda en `build/apk/app-release.apk`.
+El APK queda en `build/apk/synctask.apk`.
+
+Las dos rarezas de esa secuencia tienen explicacion, y conviene conocerlas
+porque si no parecen un error:
+
+**Por que `-vv`.** Sin el, Flet lee la salida del proceso que empaqueta Python
+con `subprocess.run(capture_output=True)`, que espera a que se cierre la
+tuberia. En Windows un proceso nieto puede heredar ese descriptor y mantenerla
+abierta, de modo que la compilacion se queda colgada para siempre en
+«Packaging Python app» sin escribir un solo archivo. Con `-vv` Flet usa otro
+camino —transmite la salida en vivo— y el problema no aparece. Se comprobo:
+colgado 75 minutos sin `-vv`, pasa de largo con el.
+
+**Por que se compila dos veces.** El parcheador modifica archivos que Flet
+*genera*, asi que no existen hasta la primera compilacion. Esa primera pasada
+esta condenada a fallar en `checkReleaseAarMetadata`; es lo esperado. Es
+idempotente, de modo que ejecutarlo de mas no rompe nada.
+
+Lo que hace el parcheador, que viene con la propia extension
+`flet-notifications`: activa el *core library desugaring* que exige
+`flutter_local_notifications`, agrega sus receptores al manifiesto y, con
+`--foreground-service-type dataSync`, declara el servicio en primer plano.
+
+Esa ultima bandera no es opcional en este proyecto. Sin ella el servicio no
+puede arrancar y las notificaciones vuelven a llegar solo con la aplicacion
+abierta en pantalla, que es exactamente el problema que se reporto tras una
+semana de uso.
+
+Despues de un `rmdir /s /q build` hay que repetir los tres pasos, porque los
+parches se van con la carpeta.
+
+> En la primera version esta carpeta traia un `parche_desugaring.py` escrito
+> a mano. Se quito al descubrir que la extension ya incluia su propio
+> parcheador, que ademas hace mas cosas. Si ese archivo sigue en su copia,
+> borrelo: ya no se usa.
 
 La primera compilacion descarga el SDK de Flutter y el de Android: son varios
 gigabytes y puede tardar bastante. **Compruebe el espacio libre antes de

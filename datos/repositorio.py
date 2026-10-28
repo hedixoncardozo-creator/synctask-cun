@@ -494,34 +494,50 @@ def eliminar_tarea(id_proyecto, id_tarea):
 DIAS_DE_VIGENCIA = 30
 
 
-def crear_testigo(id_usuario):
-    """Emite un testigo de sesion y devuelve su cadena."""
+def crear_testigo(id_usuario, perfil=None):
+    """Emite un testigo de sesion y devuelve su cadena.
+
+    Si se pasa `perfil`, se guarda junto al testigo una copia del nombre y el
+    correo. No es un capricho de normalizacion: al reabrir la aplicacion hay
+    que traducir el testigo a un usuario, y sin esa copia hacen falta DOS
+    consultas seguidas a DynamoDB —una para el testigo y otra para el perfil—
+    que el telefono espera antes de poder pintar nada. Con la copia basta una.
+
+    Es la misma tecnica de desnormalizacion que ya usa este modulo para el
+    indice de proyectos por usuario. Lo copiado es poco y cambia poco: nombre
+    y correo. Si el usuario se cambia el nombre, los testigos ya emitidos
+    mostraran el anterior hasta que vuelva a ingresar, que es un precio
+    razonable por quitar una espera en cada apertura.
+    """
     testigo = secrets.token_urlsafe(32)
     momento = datetime.now(timezone.utc)
     caduca = momento + timedelta(days=DIAS_DE_VIGENCIA)
 
-    obtener_tabla().put_item(
-        Item={
-            "PK": f"TESTIGO#{testigo}",
-            "SK": "SESION",
-            "id_usuario": id_usuario,
-            "fecha_emision": momento.isoformat(),
-            "fecha_caducidad": caduca.isoformat(),
-            # Segundos desde la epoca, para poder activar mas adelante la
-            # expiracion automatica de DynamoDB sobre este atributo y que la
-            # tabla se limpie sola sin un proceso de mantenimiento.
-            "caduca_epoch": int(caduca.timestamp()),
-        }
-    )
+    elemento = {
+        "PK": f"TESTIGO#{testigo}",
+        "SK": "SESION",
+        "id_usuario": id_usuario,
+        "fecha_emision": momento.isoformat(),
+        "fecha_caducidad": caduca.isoformat(),
+        # Segundos desde la epoca, para poder activar mas adelante la
+        # expiracion automatica de DynamoDB sobre este atributo y que la
+        # tabla se limpie sola sin un proceso de mantenimiento.
+        "caduca_epoch": int(caduca.timestamp()),
+    }
+    if perfil:
+        elemento["nombre_cache"] = perfil.get("nombre", "")
+        elemento["correo_cache"] = perfil.get("correo", "")
+
+    obtener_tabla().put_item(Item=elemento)
     return testigo
 
 
-def usuario_de_testigo(testigo):
-    """Devuelve el identificador de usuario del testigo, o None.
+def _testigo_vigente(testigo):
+    """Lee el elemento del testigo si existe y no ha caducado.
 
-    Comprueba la caducidad en el momento de usar el testigo y no confia en que
-    la expiracion automatica de la tabla ya lo haya retirado: esa expiracion no
-    garantiza un instante exacto de borrado.
+    La caducidad se comprueba al usarlo y no se confia en que la expiracion
+    automatica de la tabla ya lo haya retirado: esa expiracion no garantiza un
+    instante exacto de borrado.
     """
     if not testigo:
         return None
@@ -536,7 +552,40 @@ def usuario_de_testigo(testigo):
         return None
     if caduca <= datetime.now(timezone.utc):
         return None
-    return elemento.get("id_usuario")
+    return elemento
+
+
+def usuario_de_testigo(testigo):
+    """Devuelve el identificador de usuario del testigo, o None."""
+    elemento = _testigo_vigente(testigo)
+    return elemento.get("id_usuario") if elemento else None
+
+
+def sesion_de_testigo(testigo):
+    """Traduce un testigo a un perfil en UNA sola consulta.
+
+    Devuelve `(id_usuario, perfil)`. El perfil puede venir como None cuando el
+    testigo se emitio antes de que se guardara la copia —los que ya estan en
+    los telefonos del equipo—; en ese caso quien llama completa con
+    `obtener_usuario`, que es el camino de dos consultas de siempre. Asi el
+    cambio no obliga a nadie a volver a ingresar.
+    """
+    elemento = _testigo_vigente(testigo)
+    if not elemento:
+        return None, None
+
+    id_usuario = elemento.get("id_usuario")
+    if not id_usuario:
+        return None, None
+
+    if "nombre_cache" not in elemento:
+        return id_usuario, None
+
+    return id_usuario, {
+        "id_usuario": id_usuario,
+        "nombre": elemento.get("nombre_cache", ""),
+        "correo": elemento.get("correo_cache", ""),
+    }
 
 
 def revocar_testigo(testigo):
