@@ -564,6 +564,43 @@ def boton_discreto(etiqueta, al_pulsar, icono=None, color=None):
     )
 
 
+# Pagina que ve la persona en la pestaña del navegador justo despues de
+# aceptar en Google, antes de volver a la aplicacion.
+#
+# Flet trae una por defecto, pero esta en ingles, sin formato, y dice "puede
+# cerrar esta pestaña" mientras intenta cerrarla sola con window.close(). Ese
+# cierre automatico no funciona en Android: `launch_url` abre el navegador
+# externo del telefono y una pestaña que no abrio un script no se puede
+# cerrar por programa. Comprobado en el telefono: la pestaña se queda ahi.
+#
+# Asi que en lugar de prometer un cierre que no ocurre, esta pagina dice en
+# castellano lo unico que la persona necesita saber: que ya entro y que
+# vuelva atras. Se intenta el cierre igualmente por si el navegador lo
+# permite, y si no, no se ha prometido nada que no se cumpla.
+PAGINA_DE_REGRESO = """<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Listo - SyncTask CUN</title>
+<style>
+ html,body{margin:0;height:100%}
+ body{background:#4F46E5;color:#fff;display:flex;align-items:center;
+      justify-content:center;text-align:center;padding:28px;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+ .m{width:84px;height:84px;border-radius:26px;background:#fff;color:#4F46E5;
+    font-size:38px;font-weight:700;display:flex;align-items:center;
+    justify-content:center;margin:0 auto 26px}
+ h1{font-size:27px;margin:0 0 14px;font-weight:700}
+ p{font-size:17px;margin:0;color:#E0E7FF;line-height:1.5}
+</style></head>
+<body><div>
+ <div class="m">ST</div>
+ <h1>Sesion iniciada</h1>
+ <p>Ya puede volver a SyncTask CUN.<br>Cierre esta pestaña para continuar.</p>
+</div>
+<script>setTimeout(function(){try{window.close()}catch(e){}},600)</script>
+</body></html>"""
+
+
 def boton_con_google(etiqueta, al_pulsar):
     """Boton de acceso con Google: claro, con borde, al lado del principal.
 
@@ -653,7 +690,8 @@ def acceso_con_google(page, estado, etiqueta):
             # nada y no levanta error, el mismo defecto silencioso que ya
             # mordio tres veces en este proyecto. Ver en_el_bucle().
             try:
-                await page.login(proveedor)
+                await page.login(proveedor,
+                                 complete_page_html=PAGINA_DE_REGRESO)
             except Exception as fallo:  # noqa: BLE001
                 avisar(page, f"No se pudo abrir el acceso con Google: {fallo}",
                        Tono.PELIGRO)
