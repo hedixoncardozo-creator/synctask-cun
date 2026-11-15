@@ -12,6 +12,19 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/synctask
 Environment=PYTHONUNBUFFERED=1
 Environment=AWS_DEFAULT_REGION=us-east-1
+# Credenciales del acceso con Google. El archivo NO esta en el repositorio y
+# no debe estarlo: contiene el secreto del cliente. Se crea a mano en el
+# servidor, propiedad de root y con permisos 600, con estas tres lineas:
+#
+#     GOOGLE_CLIENT_ID=...apps.googleusercontent.com
+#     GOOGLE_CLIENT_SECRET=...
+#     GOOGLE_REDIRECT_URL=https://52-54-228-167.nip.io/oauth_callback
+#
+# El guion inicial hace que el servicio arranque igual si el archivo todavia
+# no existe. Es deliberado: sin el, olvidar crearlo dejaria la aplicacion
+# entera sin arrancar, cuando lo unico que no funciona es un boton. Si falta,
+# acceso_google.configurado() devuelve False y la interfaz no lo ofrece.
+EnvironmentFile=-/etc/synctask/google.env
 ExecStart=/home/ubuntu/venv/bin/python3 /home/ubuntu/synctask/main.py
 Restart=always
 RestartSec=5

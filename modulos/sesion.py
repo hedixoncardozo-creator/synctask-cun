@@ -46,9 +46,23 @@ LONGITUD_MINIMA_CLAVE = 8
 
 PATRON_CORREO = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-# Dominio institucional esperado. Se deja como lista para admitir variantes
-# sin tocar la logica; una lista vacia desactiva la comprobacion.
-DOMINIOS_ADMITIDOS = ("cun.edu.co",)
+# Dominios admitidos para registrarse. Una lista vacia desactiva la
+# comprobacion y deja entrar cualquier correo.
+#
+# Estuvo en ("cun.edu.co",) y se abrio a proposito. El motivo: la aplicacion
+# se sustenta y se prueba con personas que no siempre tienen a mano el correo
+# institucional, y cerrar el registro a un dominio impedia que un jurado o un
+# companero de otro programa pudiera probarla en el momento.
+#
+# Lo que se pierde al abrirlo conviene decirlo, no esconderlo: el correo ya no
+# acredita pertenencia a la institucion. Lo que NO se pierde es el control de
+# quien ve que: a un proyecto solo se entra con su codigo de invitacion, asi
+# que tener cuenta no da acceso a ningun tablero ajeno. El dominio era una
+# comodidad, el codigo de invitacion es la medida que de verdad protege.
+#
+# Para volver a cerrarlo basta con poner aqui los dominios; no hay que tocar
+# ninguna otra linea.
+DOMINIOS_ADMITIDOS = ()
 
 
 class ErrorDeRegistro(Exception):
@@ -202,6 +216,19 @@ def autenticar(correo, clave):
     if elemento is None:
         return None
 
+    # Una cuenta creada con Google no tiene contraseña derivada ni sal. Sin
+    # esta guarda, el acceso de abajo levantaria KeyError y la interfaz diria
+    # "no se pudo verificar la cuenta", que es un mensaje de fallo tecnico
+    # para algo que no es un fallo.
+    #
+    # Se devuelve None, el mismo resultado que una contraseña equivocada, y no
+    # un mensaje del tipo "esa cuenta entra con Google": decirlo confirmaria
+    # que ese correo tiene cuenta, que es justo lo que el mensaje unico de mas
+    # abajo esta evitando. La salida para esa persona es el boton de Google,
+    # que esta en la misma pantalla.
+    if not elemento.get("clave_derivada") or not elemento.get("sal"):
+        return None
+
     parametros = elemento.get("parametros_kdf", {})
     derivada = hashlib.scrypt(
         (clave or "").encode("utf-8"),
@@ -216,6 +243,127 @@ def autenticar(correo, clave):
         return None
 
     return _perfil_publico(elemento)
+
+
+def _crear_desde_google(nombre, correo, google_sub):
+    """Crea una cuenta sin contraseña a partir de un perfil de Google.
+
+    Es la misma transaccion de dos elementos que `registrar_usuario`: perfil y
+    espejo de correo, ambos con attribute_not_exists. Dos personas no pueden
+    quedarse con el mismo correo aunque pulsen el boton a la vez, porque la
+    unicidad la impone la base de datos y no una consulta previa.
+
+    No se guarda clave_derivada ni sal, y eso es intencional: una cuenta de
+    Google no tiene contraseña en esta aplicacion. `autenticar` ya sabe
+    reconocer ese caso.
+    """
+    tabla = obtener_tabla()
+    cliente = tabla.meta.client
+
+    id_usuario = str(uuid.uuid4())
+    momento = _ahora()
+
+    perfil = {
+        "PK": f"USUARIO#{id_usuario}",
+        "SK": "PERFIL",
+        "id_usuario": id_usuario,
+        "nombre": nombre.strip(),
+        "correo": correo,
+        "origen": "google",
+        "google_sub": google_sub,
+        # Entrar con Google es un acto expreso del titular sobre su propia
+        # cuenta, y la pantalla de ingreso enlaza el aviso de privacidad antes
+        # de ofrecer el boton. Queda registrado igual que en el registro
+        # normal para que la trazabilidad de la Ley 1581 no dependa de por
+        # donde entro la persona.
+        "autoriza_tratamiento": True,
+        "fecha_autorizacion": momento,
+        "fecha_creacion": momento,
+    }
+
+    espejo = {
+        "PK": f"CORREO#{correo}",
+        "SK": "USUARIO",
+        "id_usuario": id_usuario,
+        "fecha_creacion": momento,
+    }
+
+    cliente.transact_write_items(
+        TransactItems=[
+            {"Put": {
+                "TableName": NOMBRE_TABLA,
+                "Item": perfil,
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }},
+            {"Put": {
+                "TableName": NOMBRE_TABLA,
+                "Item": espejo,
+                "ConditionExpression": "attribute_not_exists(PK)",
+            }},
+        ]
+    )
+
+    return _perfil_publico(perfil)
+
+
+def _anotar_google(id_usuario, google_sub):
+    """Deja constancia del identificador de Google en una cuenta existente.
+
+    Es informativo: el enlace se hace por correo, no por este campo. Sirve
+    para poder auditar despues quien entro por Google, y no se deja fallar la
+    sesion si la escritura no sale.
+    """
+    try:
+        obtener_tabla().update_item(
+            Key={"PK": f"USUARIO#{id_usuario}", "SK": "PERFIL"},
+            UpdateExpression="SET google_sub = :s",
+            ConditionExpression="attribute_not_exists(google_sub)",
+            ExpressionAttributeValues={":s": google_sub},
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def acceder_con_google(perfil_google):
+    """Resuelve un perfil de Google a una cuenta de SyncTask.
+
+    `perfil_google` es lo que devuelve acceso_google.perfil_de(), que ya
+    comprobo que el correo viene verificado. Aqui se da por hecho.
+
+    La politica de enlace, que es la decision de diseño de todo esto: si el
+    correo ya tiene cuenta, se entra a ESA cuenta, no se crea una segunda. Es
+    lo que la persona espera —se registro con su correo y entra con su
+    correo— y es seguro precisamente porque Google solo marca como verificado
+    el correo cuyo buzon controla el titular. Enlazar por correo sin esa
+    comprobacion seria regalar cuentas ajenas a quien declare el correo.
+
+    Limitacion conocida, por si aparece: el enlace es por correo. Si alguien
+    cambia la direccion de su cuenta de Google, la proxima vez entrara a una
+    cuenta nueva en lugar de a la suya. Para el alcance del curso no compensa
+    resolverlo; para resolverlo habria que buscar primero por google_sub.
+    """
+    correo = _normalizar_correo(perfil_google["correo"])
+    sub = perfil_google["sub"]
+
+    elemento = _buscar_por_correo(correo)
+    if elemento is not None:
+        _anotar_google(elemento["id_usuario"], sub)
+        return _perfil_publico(elemento)
+
+    try:
+        return _crear_desde_google(perfil_google["nombre"], correo, sub)
+    except ClientError as error:
+        if error.response["Error"]["Code"] != "TransactionCanceledException":
+            raise
+        # Carrera: alguien creo esa cuenta entre la consulta y la escritura.
+        # No es un error para quien esta ingresando; la cuenta que queria ya
+        # existe, asi que se entra a ella.
+        elemento = _buscar_por_correo(correo)
+        if elemento is None:
+            raise ErrorDeRegistro(
+                "No se pudo crear la cuenta con Google. Intentelo de nuevo."
+            )
+        return _perfil_publico(elemento)
 
 
 def obtener_usuario(id_usuario):

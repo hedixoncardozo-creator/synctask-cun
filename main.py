@@ -50,8 +50,8 @@ from datetime import date, datetime, timezone
 
 import flet as ft
 
-from modulos import (avisos, comentarios, medicion, notificaciones,
-                     proyectos, recordar, sesion, tareas)
+from modulos import (acceso_google, avisos, comentarios, medicion,
+                     notificaciones, proyectos, recordar, sesion, tareas)
 
 # ===========================================================================
 # Sistema visual
@@ -97,7 +97,7 @@ FILTRO_MIAS = "Mias"
 FILTRO_VENCIDAS = "Vencidas"
 
 AVISO_DE_PRIVACIDAD = (
-    "SyncTask CUN recoge su nombre, su correo institucional y los datos de las "
+    "SyncTask CUN recoge su nombre, su correo electronico y los datos de las "
     "tareas y comentarios que escriba. La contrasena no se almacena: se guarda "
     "unicamente un valor derivado con el que no es posible reconstruirla. La "
     "informacion se usa solo para operar la aplicacion dentro del curso, se "
@@ -564,6 +564,144 @@ def boton_discreto(etiqueta, al_pulsar, icono=None, color=None):
     )
 
 
+def boton_con_google(etiqueta, al_pulsar):
+    """Boton de acceso con Google: claro, con borde, al lado del principal.
+
+    Se deja secundario a proposito. El ingreso con correo y contraseña sigue
+    siendo el camino principal de la aplicacion, y un boton de Google en
+    indigo competiria con el de "Ingresar" sin que ninguno de los dos se lea
+    como la accion esperada.
+
+    Sobre la marca: las guias de Google piden su boton oficial con su
+    logotipo. Aqui se usa un icono neutro para no meter una marca ajena en el
+    repositorio. Para cumplir la guia al pie de la letra basta con descargar
+    el recurso oficial desde la documentacion de Google, dejarlo en assets/ y
+    cambiar `icon=` por `content=ft.Row([...ft.Image(src="google.png",
+    width=18), ft.Text(etiqueta)...])`.
+    """
+    return ft.Button(
+        content=etiqueta,
+        icon=ft.Icons.ACCOUNT_CIRCLE_OUTLINED,
+        on_click=al_pulsar,
+        bgcolor=Tono.SUPERFICIE,
+        color=Tono.TINTA,
+        elevation=0,
+        style=ft.ButtonStyle(
+            shape=ft.RoundedRectangleBorder(radius=10),
+            side=ft.BorderSide(1, Tono.BORDE),
+            padding=ft.Padding.symmetric(horizontal=18, vertical=18),
+            text_style=ft.TextStyle(size=14, weight=ft.FontWeight.W_600),
+        ),
+    )
+
+
+def separador_o():
+    """Linea - "o" - linea, para separar los dos caminos de entrada."""
+    def raya():
+        return ft.Container(height=1, bgcolor=Tono.BORDE, expand=True)
+
+    return ft.Row(
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        spacing=12,
+        controls=[
+            raya(),
+            ft.Text(value="o", size=12, color=Tono.TINTA_TENUE),
+            raya(),
+        ],
+    )
+
+
+def acceso_con_google(page, estado, etiqueta):
+    """Devuelve el boton de Google, o None si el servidor no lo tiene listo.
+
+    Devolver None es parte del diseño: si faltan las credenciales en el
+    entorno, la pantalla no ofrece el boton en lugar de ofrecer uno que
+    falla al pulsarlo. Ver modulos/acceso_google.py.
+    """
+    if not acceso_google.configurado():
+        return None
+
+    def pulsar(e):
+        try:
+            proveedor = acceso_google.crear_proveedor()
+        except acceso_google.ErrorDeGoogle as fallo:
+            avisar(page, str(fallo), Tono.PELIGRO)
+            return
+
+        async def abrir():
+            # page.login() es una corrutina: llamarla sin esperarla no abre
+            # nada y no levanta error, el mismo defecto silencioso que ya
+            # mordio tres veces en este proyecto. Ver en_el_bucle().
+            try:
+                await page.login(proveedor)
+            except Exception as fallo:  # noqa: BLE001
+                avisar(page, f"No se pudo abrir el acceso con Google: {fallo}",
+                       Tono.PELIGRO)
+
+        if not en_el_bucle(estado, abrir):
+            avisar(page, "No se pudo abrir el acceso con Google.", Tono.PELIGRO)
+
+    return boton_con_google(etiqueta, pulsar)
+
+
+def consentimiento_de_google(page):
+    """Linea de consentimiento que acompaña al boton de Google.
+
+    Hace falta porque entrar con Google crea la cuenta cuando no existe: para
+    quien lo use por primera vez, la pantalla de ingreso cumple la funcion de
+    registro, y la autorizacion del titular (REQ-08, Ley 1581 de 2012) no
+    puede depender de que haya pasado antes por la otra pantalla.
+    """
+    def ver_aviso(e):
+        page.show_dialog(
+            ft.AlertDialog(
+                title=ft.Text(value="Aviso de privacidad", size=16,
+                              weight=ft.FontWeight.W_700),
+                # Caja de alto fijo y con desplazamiento. Sin el alto, el
+                # dialogo se estiraba hasta ocupar la pantalla entera y el
+                # boton de cerrar quedaba a un palmo del texto.
+                content=ft.Container(
+                    width=320,
+                    height=340,
+                    content=ft.Column(
+                        scroll=ft.ScrollMode.AUTO,
+                        controls=[ft.Text(value=AVISO_DE_PRIVACIDAD, size=12,
+                                          color=Tono.TINTA, selectable=True)],
+                    ),
+                ),
+                actions=[boton_discreto("Entendido",
+                                        lambda _: page.pop_dialog(),
+                                        color=Tono.ACENTO)],
+            )
+        )
+
+    # Enlace con relleno propio y del mismo tamaño que el texto: con el
+    # relleno de boton_discreto, la frase quedaba partida por un hueco que la
+    # hacia leer como dos cosas distintas.
+    enlace = ft.TextButton(
+        content="aviso de privacidad",
+        on_click=ver_aviso,
+        style=ft.ButtonStyle(
+            color=Tono.ACENTO,
+            padding=ft.Padding.symmetric(horizontal=3, vertical=2),
+            shape=ft.RoundedRectangleBorder(radius=6),
+            text_style=ft.TextStyle(size=11, weight=ft.FontWeight.W_600),
+        ),
+    )
+
+    return ft.Row(
+        alignment=ft.MainAxisAlignment.CENTER,
+        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+        spacing=0,
+        wrap=True,
+        controls=[
+            ft.Text(value="Al continuar acepta el ", size=11,
+                    color=Tono.TINTA_TENUE),
+            enlace,
+        ],
+    )
+
+
 def boton_estado(destino, al_pulsar):
     """Boton de cambio de estado con forma de boton, no de enlace.
 
@@ -823,7 +961,7 @@ def vista_restaurando(page, estado):
 
 
 def vista_ingreso(page, estado):
-    correo = campo("Correo institucional", keyboard_type=ft.KeyboardType.EMAIL,
+    correo = campo("Correo", keyboard_type=ft.KeyboardType.EMAIL,
                    autofocus=True)
     clave = campo("Contrasena", password=True, can_reveal_password=True)
     error = ft.Text(value="", color=Tono.PELIGRO, size=12, visible=False)
@@ -870,6 +1008,20 @@ def vista_ingreso(page, estado):
     boton_entrar = boton("Ingresar", entrar, ft.Icons.ARROW_FORWARD)
     clave.on_submit = entrar
 
+    # El boton de Google va DENTRO de la misma tarjeta y debajo del separador,
+    # no suelto al pie de la pantalla. Son dos formas de hacer lo mismo
+    # —entrar— y separarlas en dos bloques distintos hace dudar sobre si la de
+    # abajo sirve para otra cosa.
+    dentro = [correo, clave, error, boton_entrar]
+    con_google = acceso_con_google(page, estado, "Continuar con Google")
+    if con_google is not None:
+        # El consentimiento no puede quedarse solo en la pantalla de registro.
+        # Entrar con Google crea la cuenta si no existia, de modo que para esa
+        # persona esta ES la pantalla de registro, y REQ-08 exige autorizacion
+        # expresa del titular. La linea avisa y el enlace muestra el texto
+        # completo sin sacarla de donde esta.
+        dentro += [separador_o(), con_google, consentimiento_de_google(page)]
+
     return ft.View(
         route="/",
         bgcolor=Tono.FONDO,
@@ -893,7 +1045,7 @@ def vista_ingreso(page, estado):
                         ft.Column(
                             spacing=14,
                             horizontal_alignment=ft.CrossAxisAlignment.STRETCH,
-                            controls=[correo, clave, error, boton_entrar],
+                            controls=dentro,
                         ),
                         relleno=18,
                     ),
@@ -923,7 +1075,7 @@ def vista_ingreso(page, estado):
 
 def vista_registro(page, estado):
     nombre = campo("Nombre y apellido", autofocus=True)
-    correo = campo("Correo institucional", keyboard_type=ft.KeyboardType.EMAIL)
+    correo = campo("Correo", keyboard_type=ft.KeyboardType.EMAIL)
     clave = campo("Contrasena", password=True, can_reveal_password=True)
     repetir = campo("Repita la contrasena", password=True,
                     can_reveal_password=True)
@@ -997,6 +1149,15 @@ def vista_registro(page, estado):
 
     boton_crear = boton("Crear mi cuenta", registrar, ft.Icons.PERSON_ADD_ALT)
 
+    # Aqui el aviso de privacidad ya esta a la vista y la casilla de
+    # autorizacion tambien, asi que el boton de Google no repite la linea de
+    # consentimiento: bastaria con duplicar el mismo texto dos veces en la
+    # misma pantalla.
+    pie = [boton_crear]
+    con_google = acceso_con_google(page, estado, "Registrarse con Google")
+    if con_google is not None:
+        pie += [separador_o(), con_google]
+
     return ft.View(
         route="/registro",
         bgcolor=Tono.FONDO,
@@ -1013,7 +1174,7 @@ def vista_registro(page, estado):
                 aviso,
                 autoriza,
                 error,
-                boton_crear,
+                *pie,
             ])
         ],
         padding=ft.Padding.all(0),
@@ -2380,6 +2541,70 @@ def main(page: ft.Page):
         except Exception:  # noqa: BLE001
             pass
 
+    def al_responder_google(evento):
+        """Llega cuando Google ya confirmo —o rechazo— la identidad.
+
+        El recorrido completo esta explicado en modulos/acceso_google.py. Lo
+        que importa aqui: para cuando esto se ejecuta, el canje del codigo por
+        el token ya ocurrio servidor contra servidor y el telefono ya cerro su
+        vista web. Solo queda resolver que cuenta de SyncTask corresponde.
+        """
+        if getattr(evento, "error", None):
+            detalle = (getattr(evento, "error_description", None)
+                       or getattr(evento, "error", "") or "")
+            avisar(page, f"Google no completo el ingreso. {detalle}".strip(),
+                   Tono.PELIGRO)
+            return
+
+        try:
+            perfil = acceso_google.perfil_de(
+                getattr(getattr(page, "auth", None), "user", None))
+        except acceso_google.ErrorDeGoogle as fallo:
+            avisar(page, str(fallo), Tono.PELIGRO)
+            return
+
+        # Se reutiliza la pantalla de espera del arranque mientras se resuelve
+        # la cuenta. La vista web de Google acaba de cerrarse de golpe y sin
+        # esto la persona ve un instante el formulario de ingreso vacio, que
+        # se lee exactamente como "no funciono".
+        estado.restaurando = True
+        al_cambiar_de_ruta()
+
+        def terminar(usuario, fallo):
+            # Se apaga SIEMPRE y lo primero, pase lo que pase: si esto no
+            # ocurriera, un fallo dejaria la aplicacion girando para siempre.
+            estado.restaurando = False
+            if fallo or not usuario:
+                avisar(page,
+                       f"No se pudo completar el ingreso: {fallo}" if fallo
+                       else "No se pudo completar el ingreso con Google.",
+                       Tono.PELIGRO)
+                al_cambiar_de_ruta()
+                return
+            estado.usuario = usuario
+            iniciar_vigilancia(estado)
+            page.navigate("/proyectos")
+
+        def envoltura():
+            # DynamoDB bloquea. Hacerlo en el bucle congelaria la sesion de
+            # todas las personas conectadas, porque el servidor es uno solo.
+            resultado, error = None, None
+            try:
+                resultado = sesion.acceder_con_google(perfil)
+                if resultado:
+                    recordar.recordar(estado.bucle, estado.preferencias,
+                                      resultado)
+            except Exception as fallo:  # noqa: BLE001
+                error = fallo
+            bucle = getattr(estado, "bucle", None)
+            if bucle is None:
+                terminar(resultado, error)
+            else:
+                bucle.call_soon_threadsafe(terminar, resultado, error)
+
+        page.run_thread(envoltura)
+
+    page.on_login = al_responder_google
     page.on_route_change = al_cambiar_de_ruta
     page.on_view_pop = al_volver
     page.on_disconnect = al_desconectar
