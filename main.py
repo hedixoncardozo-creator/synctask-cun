@@ -628,6 +628,26 @@ def acceso_con_google(page, estado, etiqueta):
             avisar(page, str(fallo), Tono.PELIGRO)
             return
 
+        # Mantener viva la aplicacion mientras Android muestra la pantalla de
+        # Google ENCIMA de ella.
+        #
+        # Sin esto el ingreso con Google no funciona en el APK, y se midio en
+        # el diario del servidor: a los seis segundos de pulsar el boton
+        # aparecia "Session disconnected" y "Disposing FletApp". Android
+        # suspende la aplicacion al pasar a segundo plano, con ella se corta
+        # la conexion, y cuando Google devuelve a la persona el servidor ya no
+        # tiene a quien entregarle la respuesta. En navegador no pasa porque
+        # Flet abre Google en una pestaña aparte y la original sigue viva.
+        #
+        # El servicio en primer plano es justo lo que evita esa suspension, y
+        # ya estaba construido para las notificaciones. Lo unico que faltaba
+        # era encenderlo ANTES de salir hacia Google: hasta ahora solo se
+        # encendia al iniciar sesion, que es demasiado tarde, porque el
+        # momento critico es precisamente este.
+        #
+        # Es idempotente: si ya estaba encendido no hace nada.
+        iniciar_vigilancia(estado)
+
         async def abrir():
             # page.login() es una corrutina: llamarla sin esperarla no abre
             # nada y no levanta error, el mismo defecto silencioso que ya
@@ -2586,6 +2606,12 @@ def main(page: ft.Page):
             # ocurriera, un fallo dejaria la aplicacion girando para siempre.
             estado.restaurando = False
             if fallo or not usuario:
+                # Se encendio el servicio en primer plano para sobrevivir al
+                # paso por Google; si el ingreso no prospero hay que apagarlo,
+                # o quedaria un aviso permanente en la bandeja de alguien que
+                # ni siquiera tiene la sesion abierta.
+                if not estado.usuario:
+                    detener_vigilancia(estado)
                 avisar(page,
                        f"No se pudo completar el ingreso: {fallo}" if fallo
                        else "No se pudo completar el ingreso con Google.",
