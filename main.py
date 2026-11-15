@@ -2572,6 +2572,40 @@ def main(page: ft.Page):
         except Exception:  # noqa: BLE001
             pass
 
+    # --- Rodeo a un error de Flet 0.86.5 -----------------------------------
+    #
+    # Al volver de Google, Flet decide que hacer con esta comprobacion, en
+    # flet/controls/page.py, dentro de _authorize_callback:
+    #
+    #     if self.platform in ["ios", "android"]:
+    #         await self.close_in_app_web_view()     # movil
+    #     else:
+    #         await self.window.to_front()           # escritorio
+    #
+    # `page.platform` es un enum PagePlatform que NO hereda de str, de modo
+    # que `PagePlatform.ANDROID in ["ios", "android"]` es False. En el
+    # telefono entra siempre por la rama de escritorio y pide traer al frente
+    # una ventana que en Android no existe: el cliente no responde, la espera
+    # agota sus diez segundos y lanza
+    #
+    #     RuntimeError: TimeoutException ... Window(2).to_front
+    #
+    # El ingreso nunca se completa y el servidor devuelve 500. Se midio en el
+    # telefono: el regreso de Google llegaba bien y moria justo ahi.
+    #
+    # Se desactiva esa llamada en las sesiones de telefono —donde ademas no
+    # significa nada— y mas abajo se cierra la vista web a mano, que es lo
+    # que Flet haria de haber acertado la rama. Cuando el error se corrija
+    # aguas arriba, esto se puede quitar sin tocar nada mas.
+    if not page.web:
+        async def _no_traer_al_frente():
+            return None
+
+        try:
+            page.window.to_front = _no_traer_al_frente
+        except Exception:  # noqa: BLE001
+            pass
+
     def al_responder_google(evento):
         """Llega cuando Google ya confirmo —o rechazo— la identidad.
 
@@ -2580,6 +2614,18 @@ def main(page: ft.Page):
         el token ya ocurrio servidor contra servidor y el telefono ya cerro su
         vista web. Solo queda resolver que cuenta de SyncTask corresponde.
         """
+        # Cerrar la pestaña de Google que quedo encima de la aplicacion. Esto
+        # lo haria Flet solo, pero por el error descrito mas arriba no lo
+        # hace en el telefono. Va antes de cualquier otra cosa para que la
+        # persona vuelva a ver su aplicacion aunque el ingreso falle.
+        #
+        # Flet marca este metodo como obsoleto a favor de
+        # UrlLauncher().close_in_app_web_view() a partir de 0.90; se queda
+        # este porque es el que enruta por la sesion correcta en 0.86 y lo
+        # unico que cuesta es un aviso en el diario.
+        if not page.web:
+            en_el_bucle(estado, lambda: page.close_in_app_web_view())
+
         if getattr(evento, "error", None):
             detalle = (getattr(evento, "error_description", None)
                        or getattr(evento, "error", "") or "")
