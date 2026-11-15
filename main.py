@@ -1149,10 +1149,10 @@ def vista_registro(page, estado):
 
     boton_crear = boton("Crear mi cuenta", registrar, ft.Icons.PERSON_ADD_ALT)
 
-    # Aqui el aviso de privacidad ya esta a la vista y la casilla de
-    # autorizacion tambien, asi que el boton de Google no repite la linea de
-    # consentimiento: bastaria con duplicar el mismo texto dos veces en la
-    # misma pantalla.
+    # El boton de Google no repite la linea de consentimiento que si lleva en
+    # la pantalla de ingreso: aqui la casilla de autorizacion esta justo
+    # encima de ambos botones y el aviso completo esta en la misma pantalla,
+    # asi que seria decir tres veces lo mismo.
     pie = [boton_crear]
     con_google = acceso_con_google(page, estado, "Registrarse con Google")
     if con_google is not None:
@@ -1171,10 +1171,21 @@ def vista_registro(page, estado):
                               controls=[nombre, correo, clave, repetir]),
                     relleno=18,
                 ),
-                aviso,
+                # Orden pensado para que lo accionable quede arriba: campos,
+                # autorizacion y botones caben en la primera pantalla, y el
+                # texto largo del aviso queda al final para quien quiera
+                # leerlo.
+                #
+                # La casilla se queda ENCIMA de los botones aunque el aviso
+                # baje. Si quedara debajo, la persona pulsaria "Crear mi
+                # cuenta" sin haberla visto, recibiria un error y tendria que
+                # bajar a buscar por que. Y la autorizacion del titular tiene
+                # que ser previa al registro (REQ-08, Ley 1581), no algo que
+                # se encuentra despues de intentarlo.
                 autoriza,
                 error,
                 *pie,
+                aviso,
             ])
         ],
         padding=ft.Padding.all(0),
