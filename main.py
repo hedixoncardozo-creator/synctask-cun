@@ -620,53 +620,71 @@ def boton_discreto(etiqueta, al_pulsar, icono=None, color=None):
 
 
 # Pagina que ve la persona en la pestaña del navegador justo despues de
-# aceptar en Google, mientras la aplicacion vuelve al frente.
+# aceptar en Google.
 #
-# No se puede evitar que exista: Google tiene que devolver el navegador a una
-# direccion, y esa direccion responde algo. Lo que si se puede evitar es que
-# PAREZCA una pagina de navegador.
+# No se puede evitar que exista: Google devuelve el navegador a una direccion
+# y esa direccion responde algo. Y tampoco se puede cerrar sola, que fue lo
+# que se intento primero: close_in_app_web_view() solo cierra un webview
+# embebido, no una pestaña de Chrome. Se probo en el telefono y la pestaña se
+# quedaba quieta hasta que la persona pulsaba la X.
 #
-# La version anterior decia "Sesion iniciada. Volviendo a SyncTask CUN. Si
-# esta pantalla no se cierra sola, cierrela usted". Grabando el ingreso en un
-# telefono se vio el problema: la pestaña tarda unos segundos en cerrarse, y
-# durante ese rato la persona lee un cartel que le pide una tarea. El ingreso
-# se siente interrumpido justo cuando deberia sentirse terminado.
+# Hubo una version intermedia que imitaba la pantalla de carga de la
+# aplicacion, con la idea de que el cierre pasara desapercibido. Fue peor:
+# sin cierre automatico, la persona se quedaba mirando una rueda girando sin
+# saber que tenia que hacer algo.
 #
-# Asi que esta pagina es una copia exacta de vista_restaurando: mismo indigo,
-# misma marca blanca de 78 px, misma rueda tenue abajo. Cuando la pestaña se
-# cierra, debajo esta esa misma pantalla, porque on_login pone restaurando en
-# True. Las dos imagenes coinciden, de modo que el cierre de la pestaña deja
-# de ser un corte y pasa a ser invisible: lo que la persona percibe es una
-# sola pantalla de carga que termina en su tablero.
+# De ahi esta version. Si la unica salida es que la persona pulse la X, lo
+# honesto es decirselo y señalarsela: la flecha animada arriba a la izquierda
+# apunta justo a donde esta la X de Chrome, y el texto lo repite con
+# palabras. Se confirma primero que el ingreso funciono —para que nadie tema
+# estar cancelando algo al cerrar— y se menciona el boton de atras como
+# alternativa.
 #
-# Si se cambia vista_restaurando, hay que cambiar esto a la vez o reaparece
-# el salto.
+# La leccion, que vale para el informe: una animacion que disimula una espera
+# ayuda solo si la espera termina sola. Si hace falta que la persona actue,
+# disimular es esconderle la instruccion.
 PAGINA_DE_REGRESO = """<!doctype html>
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>SyncTask CUN</title>
 <style>
- html,body{margin:0;height:100%;background:#4F46E5;overflow:hidden}
- body{display:flex;align-items:center;justify-content:center;
-      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
- .c{display:flex;flex-direction:column;align-items:center}
+ html,body{margin:0;min-height:100%;background:#4F46E5;overflow:hidden}
+ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+ .guia{position:fixed;top:10px;left:14px;display:flex;align-items:center;
+       gap:8px;color:#fff;font-size:15px;font-weight:600;
+       animation:sube 1.1s ease-in-out infinite}
+ .guia svg{display:block}
+ @keyframes sube{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+ .c{min-height:100vh;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;padding:84px 26px 40px;box-sizing:border-box;
+    text-align:center}
  .m{width:78px;height:78px;border-radius:24px;background:#fff;color:#4F46E5;
-    font-size:33px;font-weight:700;line-height:78px;text-align:center;
-    letter-spacing:-.02em}
- .t{margin-top:18px;font-size:20px;font-weight:600;color:#fff;
-    letter-spacing:-.01em}
- .r{margin-top:30px;width:20px;height:20px;border-radius:50%;
-    border:2.2px solid rgba(255,255,255,.28);
-    border-top-color:rgba(255,255,255,.55);
-    animation:g .9s linear infinite}
- @keyframes g{to{transform:rotate(360deg)}}
+    font-size:33px;font-weight:700;line-height:78px;letter-spacing:-.02em}
+ .ok{margin-top:20px;font-size:25px;font-weight:700;color:#fff}
+ .sub{margin-top:8px;font-size:15px;color:#C7D2FE}
+ .caja{margin-top:30px;background:rgba(255,255,255,.12);border-radius:16px;
+       border:1px solid rgba(255,255,255,.22);padding:18px 20px;max-width:330px}
+ .caja p{margin:0;font-size:16px;line-height:1.5;color:#fff}
+ .caja b{font-weight:700}
+ .alt{margin-top:14px;font-size:13px;color:#C7D2FE}
 </style></head>
-<body><div class="c">
- <div class="m">ST</div>
- <div class="t">SyncTask CUN</div>
- <div class="r"></div>
-</div>
-<script>setTimeout(function(){try{window.close()}catch(e){}},400)</script>
+<body>
+ <div class="guia">
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff"
+       stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+   <path d="M12 19V5"/><path d="m5 12 7-7 7 7"/></svg>
+  <span>Toque la X de arriba</span>
+ </div>
+ <div class="c">
+  <div class="m">ST</div>
+  <div class="ok">Sesion iniciada</div>
+  <div class="sub">Su cuenta de Google quedo vinculada.</div>
+  <div class="caja">
+   <p>Para volver a SyncTask CUN, cierre esta pestaña con la
+   <b>X de la esquina superior izquierda</b>.</p>
+  </div>
+  <div class="alt">Tambien sirve el boton de atras del telefono.</div>
+ </div>
 </body></html>"""
 
 
