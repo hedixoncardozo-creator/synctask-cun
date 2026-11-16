@@ -620,40 +620,53 @@ def boton_discreto(etiqueta, al_pulsar, icono=None, color=None):
 
 
 # Pagina que ve la persona en la pestaña del navegador justo despues de
-# aceptar en Google, antes de volver a la aplicacion.
+# aceptar en Google, mientras la aplicacion vuelve al frente.
 #
-# Flet trae una por defecto, pero esta en ingles, sin formato, y dice "puede
-# cerrar esta pestaña" mientras intenta cerrarla sola con window.close(). Ese
-# cierre automatico no funciona en Android: `launch_url` abre el navegador
-# externo del telefono y una pestaña que no abrio un script no se puede
-# cerrar por programa. Comprobado en el telefono: la pestaña se queda ahi.
+# No se puede evitar que exista: Google tiene que devolver el navegador a una
+# direccion, y esa direccion responde algo. Lo que si se puede evitar es que
+# PAREZCA una pagina de navegador.
 #
-# Asi que en lugar de prometer un cierre que no ocurre, esta pagina dice en
-# castellano lo unico que la persona necesita saber: que ya entro y que
-# vuelva atras. Se intenta el cierre igualmente por si el navegador lo
-# permite, y si no, no se ha prometido nada que no se cumpla.
+# La version anterior decia "Sesion iniciada. Volviendo a SyncTask CUN. Si
+# esta pantalla no se cierra sola, cierrela usted". Grabando el ingreso en un
+# telefono se vio el problema: la pestaña tarda unos segundos en cerrarse, y
+# durante ese rato la persona lee un cartel que le pide una tarea. El ingreso
+# se siente interrumpido justo cuando deberia sentirse terminado.
+#
+# Asi que esta pagina es una copia exacta de vista_restaurando: mismo indigo,
+# misma marca blanca de 78 px, misma rueda tenue abajo. Cuando la pestaña se
+# cierra, debajo esta esa misma pantalla, porque on_login pone restaurando en
+# True. Las dos imagenes coinciden, de modo que el cierre de la pestaña deja
+# de ser un corte y pasa a ser invisible: lo que la persona percibe es una
+# sola pantalla de carga que termina en su tablero.
+#
+# Si se cambia vista_restaurando, hay que cambiar esto a la vez o reaparece
+# el salto.
 PAGINA_DE_REGRESO = """<!doctype html>
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Listo - SyncTask CUN</title>
+<title>SyncTask CUN</title>
 <style>
- html,body{margin:0;height:100%}
- body{background:#4F46E5;color:#fff;display:flex;align-items:center;
-      justify-content:center;text-align:center;padding:28px;
+ html,body{margin:0;height:100%;background:#4F46E5;overflow:hidden}
+ body{display:flex;align-items:center;justify-content:center;
       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
- .m{width:84px;height:84px;border-radius:26px;background:#fff;color:#4F46E5;
-    font-size:38px;font-weight:700;display:flex;align-items:center;
-    justify-content:center;margin:0 auto 26px}
- h1{font-size:27px;margin:0 0 14px;font-weight:700}
- p{font-size:17px;margin:0;color:#E0E7FF;line-height:1.5}
+ .c{display:flex;flex-direction:column;align-items:center}
+ .m{width:78px;height:78px;border-radius:24px;background:#fff;color:#4F46E5;
+    font-size:33px;font-weight:700;line-height:78px;text-align:center;
+    letter-spacing:-.02em}
+ .t{margin-top:18px;font-size:20px;font-weight:600;color:#fff;
+    letter-spacing:-.01em}
+ .r{margin-top:30px;width:20px;height:20px;border-radius:50%;
+    border:2.2px solid rgba(255,255,255,.28);
+    border-top-color:rgba(255,255,255,.55);
+    animation:g .9s linear infinite}
+ @keyframes g{to{transform:rotate(360deg)}}
 </style></head>
-<body><div>
+<body><div class="c">
  <div class="m">ST</div>
- <h1>Sesion iniciada</h1>
- <p>Volviendo a SyncTask CUN...<br>
- <small style="opacity:.75">Si esta pantalla no se cierra sola, cierrela usted.</small></p>
+ <div class="t">SyncTask CUN</div>
+ <div class="r"></div>
 </div>
-<script>setTimeout(function(){try{window.close()}catch(e){}},600)</script>
+<script>setTimeout(function(){try{window.close()}catch(e){}},400)</script>
 </body></html>"""
 
 
