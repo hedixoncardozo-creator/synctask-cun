@@ -133,6 +133,9 @@ class Estado:
         self.servicio_activo = False
         self.preferencias = None
         self.portapapeles = None
+        # Lanzador de direcciones. Solo se usa para el ingreso con Google, y
+        # existe para poder elegir el modo de apertura: ver acceso_con_google.
+        self.lanzador = None
         # Bucle de eventos de esta sesion. Se captura en main(), que si corre
         # dentro de el, y permite devolver el control desde un hilo trabajador.
         self.bucle = None
@@ -332,6 +335,58 @@ def copiar_al_portapapeles(estado, contenido, al_terminar):
 
     if not en_el_bucle(estado, copiar):
         al_terminar(False)
+
+
+def explicar(fallo):
+    """Traduce una excepcion en algo que una persona pueda entender.
+
+    Nace de una prueba de uso: escribiendo credenciales con la base de datos
+    inalcanzable, la pantalla respondia
+
+        No se pudo verificar la cuenta: Failed to connect to proxy URL:
+        "http://127.0.0.1:46023"
+
+    Eso no le dice nada a quien usa la aplicacion, y de paso publica detalles
+    internos del servidor. En el telefono de un companero el dia que el
+    laboratorio de AWS se apague, el mensaje seria igual de cripticio.
+
+    La regla es simple: los errores que escribe este proyecto estan redactados
+    para leerse y se muestran tal cual; cualquier otro es un fallo de
+    infraestructura, se resume en una frase util y el detalle tecnico se
+    manda al diario del servicio, que es donde sirve de algo.
+    """
+    if fallo is None:
+        return "Ocurrio un problema inesperado."
+
+    # Los errores propios ya vienen redactados para la persona.
+    if isinstance(fallo, (sesion.ErrorDeRegistro, acceso_google.ErrorDeGoogle,
+                          proyectos.ErrorDeCodigo, tareas.ErrorDePermiso)):
+        return str(fallo)
+
+    nombre = type(fallo).__name__
+    detalle = str(fallo)
+    notificaciones.registrar(f"fallo mostrado al usuario -> {nombre}: {detalle}")
+    junto = f"{nombre} {detalle}"
+
+    if any(s in junto for s in (
+            "EndpointConnection", "ConnectTimeout", "ConnectionError",
+            "ReadTimeout", "Failed to connect", "Could not connect",
+            "Name or service not known", "Temporary failure in name resolution",
+            "proxy")):
+        return ("No se pudo conectar con el servidor de datos. Revise su "
+                "conexion e intentelo de nuevo.")
+
+    if any(s in junto for s in ("ExpiredToken", "security token",
+                                "InvalidClientTokenId", "AccessDenied",
+                                "UnrecognizedClient", "NoCredentials")):
+        return ("El servidor perdio el acceso a la base de datos. Avise al "
+                "equipo del proyecto.")
+
+    if any(s in junto for s in ("Throttling", "ProvisionedThroughput",
+                                "RequestLimitExceeded")):
+        return "El servidor esta ocupado. Intentelo dentro de un momento."
+
+    return "Ocurrio un problema inesperado. Intentelo de nuevo."
 
 
 def avisar(page, mensaje, color=None):
@@ -595,7 +650,8 @@ PAGINA_DE_REGRESO = """<!doctype html>
 <body><div>
  <div class="m">ST</div>
  <h1>Sesion iniciada</h1>
- <p>Ya puede volver a SyncTask CUN.<br>Cierre esta pestaña para continuar.</p>
+ <p>Volviendo a SyncTask CUN...<br>
+ <small style="opacity:.75">Si esta pantalla no se cierra sola, cierrela usted.</small></p>
 </div>
 <script>setTimeout(function(){try{window.close()}catch(e){}},600)</script>
 </body></html>"""
@@ -685,15 +741,46 @@ def acceso_con_google(page, estado, etiqueta):
         # Es idempotente: si ya estaba encendido no hace nada.
         iniciar_vigilancia(estado)
 
+        # Abrir Google en una pestaña integrada (Chrome Custom Tabs) en lugar
+        # de en el navegador externo del telefono.
+        #
+        # Esto es lo que hace que la persona no tenga que cerrar nada a mano.
+        # Flet, por omision, usa el modo PLATFORM_DEFAULT, que en Android abre
+        # el navegador externo; una pestaña que no abrio la aplicacion no se
+        # puede cerrar por programa, asi que al volver quedaba una pestaña
+        # huerfana con un mensaje en ingles y habia que cerrarla a dedo.
+        # Medido en el telefono: la pestaña se quedaba abierta siempre.
+        #
+        # Con una pestaña integrada SI se puede cerrar desde la aplicacion, y
+        # es lo que hace close_in_app_web_view() mas abajo, en on_login.
+        #
+        # Por que una pestaña integrada y no un webview: Google rechaza el
+        # ingreso desde webviews embebidos —devuelve disallowed_useragent—
+        # precisamente para que nadie pueda leer lo que la persona teclea.
+        # Las pestañas integradas son el camino que Google recomienda: son
+        # Chrome de verdad, con sus sesiones y su barra de direcciones.
+        #
+        # En navegador no se toca nada: ahi Flet abre una ventana aparte y la
+        # pestaña original sigue viva, que es justo lo que hace falta.
+        manejador = None
+        lanzador = getattr(estado, "lanzador", None)
+        if not page.web and lanzador is not None:
+            async def abrir_en_pestana(direccion):
+                await lanzador.launch_url(
+                    direccion, mode=ft.LaunchMode.IN_APP_BROWSER_VIEW)
+
+            manejador = abrir_en_pestana
+
         async def abrir():
             # page.login() es una corrutina: llamarla sin esperarla no abre
             # nada y no levanta error, el mismo defecto silencioso que ya
             # mordio tres veces en este proyecto. Ver en_el_bucle().
             try:
                 await page.login(proveedor,
-                                 complete_page_html=PAGINA_DE_REGRESO)
+                                 complete_page_html=PAGINA_DE_REGRESO,
+                                 on_open_authorization_url=manejador)
             except Exception as fallo:  # noqa: BLE001
-                avisar(page, f"No se pudo abrir el acceso con Google: {fallo}",
+                avisar(page, f"No se pudo abrir el acceso con Google: {explicar(fallo)}",
                        Tono.PELIGRO)
 
         if not en_el_bucle(estado, abrir):
@@ -1045,7 +1132,7 @@ def vista_ingreso(page, estado):
 
         def al_terminar(usuario, fallo):
             if fallo:
-                mostrar_error(f"No se pudo verificar la cuenta: {fallo}")
+                mostrar_error(f"No se pudo verificar la cuenta: {explicar(fallo)}")
                 return
             if not usuario:
                 # Un mensaje unico para correo inexistente y contrasena
@@ -1269,7 +1356,7 @@ def vista_proyectos(page, estado):
             mios = proyectos.listar_mios(estado.usuario)
         except Exception as fallo:  # noqa: BLE001
             lista.controls.append(
-                texto(f"No se pudieron cargar los proyectos: {fallo}", 12,
+                texto(f"No se pudieron cargar los proyectos: {explicar(fallo)}", 12,
                       color=Tono.PELIGRO))
             return
         if not mios:
@@ -1332,7 +1419,7 @@ def vista_proyectos(page, estado):
                 avisar(page, str(fallo), Tono.PELIGRO)
                 return
             if fallo:
-                avisar(page, f"No se pudo vincular: {fallo}", Tono.PELIGRO)
+                avisar(page, f"No se pudo vincular: {explicar(fallo)}", Tono.PELIGRO)
                 return
             codigo.value = ""
             avisar(page, f"Se vinculo a {proyecto.get('nombre', 'el proyecto')}.",
@@ -1354,7 +1441,7 @@ def vista_proyectos(page, estado):
                 avisar(page, str(fallo), Tono.PELIGRO)
                 return
             if fallo:
-                avisar(page, f"No se pudo crear el proyecto: {fallo}",
+                avisar(page, f"No se pudo crear el proyecto: {explicar(fallo)}",
                        Tono.PELIGRO)
                 return
             nombre.value = ""
@@ -1736,7 +1823,7 @@ def vista_tablero(page, estado, id_proyecto):
             avisar(page, str(fallo), Tono.PELIGRO)
             return
         except Exception as fallo:  # noqa: BLE001
-            avisar(page, f"No se pudo mover la tarea: {fallo}", Tono.PELIGRO)
+            avisar(page, f"No se pudo mover la tarea: {explicar(fallo)}", Tono.PELIGRO)
             return
         refrescar_desde_evento(propio=True)
 
@@ -1792,7 +1879,7 @@ def vista_tablero(page, estado, id_proyecto):
 
         def al_terminar(_, fallo):
             if fallo:
-                avisar(page, f"No se pudo crear la tarea: {fallo}", Tono.PELIGRO)
+                avisar(page, f"No se pudo crear la tarea: {explicar(fallo)}", Tono.PELIGRO)
                 return
             titulo_tarea.value = ""
             descripcion_tarea.value = ""
@@ -1862,7 +1949,7 @@ def vista_tablero(page, estado, id_proyecto):
     try:
         recargar()
     except Exception as fallo:  # noqa: BLE001
-        avisar(page, f"No se pudieron cargar las tareas: {fallo}", Tono.PELIGRO)
+        avisar(page, f"No se pudieron cargar las tareas: {explicar(fallo)}", Tono.PELIGRO)
 
     vista = ft.View(
         route=f"/tablero/{id_proyecto}",
@@ -1916,7 +2003,7 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
                 if t["SK"].split("#", 1)[1] == id_tarea:
                     return t
         except Exception as fallo:  # noqa: BLE001
-            avisar(page, f"No se pudo cargar la tarea: {fallo}", Tono.PELIGRO)
+            avisar(page, f"No se pudo cargar la tarea: {explicar(fallo)}", Tono.PELIGRO)
         return None
 
     estado_vista["tarea"] = cargar_tarea()
@@ -2050,7 +2137,7 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
 
             def al_terminar(tarea_nueva, fallo):
                 if fallo:
-                    avisar(page, f"No se pudo guardar: {fallo}", Tono.PELIGRO)
+                    avisar(page, f"No se pudo guardar: {explicar(fallo)}", Tono.PELIGRO)
                     return
                 estado_vista["tarea"] = tarea_nueva
                 estado_vista["editando"] = False
@@ -2087,7 +2174,7 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
 
             def al_terminar(_, fallo):
                 if fallo:
-                    avisar(page, f"No se pudo eliminar: {fallo}", Tono.PELIGRO)
+                    avisar(page, f"No se pudo eliminar: {explicar(fallo)}", Tono.PELIGRO)
                     return
                 avisar(page, "Tarea eliminada.", Tono.TINTA)
                 page.navigate(f"/tablero/{id_proyecto}")
@@ -2245,7 +2332,7 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
             historial = comentarios.listar(id_proyecto, usuario["id_usuario"],
                                            id_tarea)
         except Exception as fallo:  # noqa: BLE001
-            hilo.controls.append(texto(f"No se pudo cargar el hilo: {fallo}", 12,
+            hilo.controls.append(texto(f"No se pudo cargar el hilo: {explicar(fallo)}", 12,
                                        color=Tono.PELIGRO))
             return
         if not historial:
@@ -2315,7 +2402,7 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
         except comentarios.ErrorDeAutoria as fallo:
             avisar(page, str(fallo), Tono.PELIGRO)
         except Exception as fallo:  # noqa: BLE001
-            avisar(page, f"No se pudo editar: {fallo}", Tono.PELIGRO)
+            avisar(page, f"No se pudo editar: {explicar(fallo)}", Tono.PELIGRO)
             return
         edicion["clave"] = None
         edicion["borrador"] = ""
@@ -2338,7 +2425,7 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
         except comentarios.ErrorDeAutoria as fallo:
             avisar(page, str(fallo), Tono.PELIGRO)
         except Exception as fallo:  # noqa: BLE001
-            avisar(page, f"No se pudo eliminar: {fallo}", Tono.PELIGRO)
+            avisar(page, f"No se pudo eliminar: {explicar(fallo)}", Tono.PELIGRO)
             return
         confirmando["clave"] = None
         repintar()
@@ -2355,7 +2442,7 @@ def vista_tarea(page, estado, id_proyecto, id_tarea):
 
         def al_terminar(_, fallo):
             if fallo:
-                avisar(page, f"No se pudo publicar: {fallo}", Tono.PELIGRO)
+                avisar(page, f"No se pudo publicar: {explicar(fallo)}", Tono.PELIGRO)
                 return
             nuevo.value = ""
             construir_hilo()
@@ -2467,6 +2554,7 @@ def main(page: ft.Page):
     portapapeles = ft.Clipboard()
     conectividad = ft.Connectivity(on_change=al_cambiar_conexion)
     vibracion = ft.HapticFeedback()
+    lanzador = ft.UrlLauncher()
     # El servicio de notificaciones solo se engancha cuando quien se conecta es
     # la aplicacion instalada en un telefono, nunca un navegador.
     #
@@ -2495,13 +2583,14 @@ def main(page: ft.Page):
     )
     notificador = notificaciones.crear_servicio() if en_telefono else None
 
-    servicios = [preferencias, portapapeles, conectividad, vibracion]
+    servicios = [preferencias, portapapeles, conectividad, vibracion, lanzador]
     if notificador is not None:
         servicios.append(notificador)
 
     estado.preferencias = preferencias
     estado.portapapeles = portapapeles
     estado.vibracion = vibracion
+    estado.lanzador = lanzador
     estado.notificador = notificador
     notificaciones.preparar(estado.bucle, notificador)
 
@@ -2697,7 +2786,7 @@ def main(page: ft.Page):
                 if not estado.usuario:
                     detener_vigilancia(estado)
                 avisar(page,
-                       f"No se pudo completar el ingreso: {fallo}" if fallo
+                       f"No se pudo completar el ingreso: {explicar(fallo)}" if fallo
                        else "No se pudo completar el ingreso con Google.",
                        Tono.PELIGRO)
                 al_cambiar_de_ruta()
